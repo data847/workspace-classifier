@@ -284,92 +284,30 @@ def _normalize_extracted_text(text: str) -> str:
     return text
 
 
-def _pdf_text_quality_score(text: str) -> float:
-    """Prefer extracts with more letters and fewer single-letter word fragments."""
-    if not text or not text.strip():
-        return -1.0
-    letters = sum(1 for c in text if c.isalpha())
-    toks = text.split()
-    if not toks:
-        return letters / max(len(text), 1)
-    singles = sum(1 for t in toks if len(t) == 1 and t.isalpha())
-    frag = singles / len(toks)
-    return (letters / max(len(text), 1)) * 1.5 - frag
-
-
 def _extract_pdf_pages(path: Path, *, max_pages: int | None) -> str | None:
-    """Extract PDF text using PyMuPDF first; pypdf only as fallback for blank pages.
-
-    PyMuPDF is faster and higher quality. pypdf is only invoked for pages where
-    fitz returned empty text (e.g. image-only pages with embedded fonts), avoiding
-    a redundant full-document pypdf pass on every PDF.
+    """Extract PDF text with pypdf.
 
     ``max_pages`` ``None`` means all pages in the document.
+
+    Avoid PyMuPDF here: malformed PDFs can segfault inside MuPDF before Python can
+    catch an exception. pypdf may extract less text, but it fails in-process safely.
     """
-    fitz_pages: list[str] = []
-    fitz_ok = False
-    blank_indices: list[int] = []
-
     try:
-        import fitz  # type: ignore  # PyMuPDF
+        from pypdf import PdfReader  # type: ignore
 
-        flags = (
-            int(fitz.TEXT_PRESERVE_WHITESPACE)
-            | int(fitz.TEXT_MEDIABOX_CLIP)
-            | int(fitz.TEXT_DEHYPHENATE)
-            | int(fitz.TEXT_USE_CID_FOR_UNKNOWN_UNICODE)
-        )
-        doc = fitz.open(str(path))
-        try:
-            n_all = doc.page_count
-            n = n_all if max_pages is None else min(max_pages, n_all)
-            for i in range(n):
-                page = doc.load_page(i)
-                t = page.get_text("text", flags=flags) or ""
-                cleaned = _normalize_extracted_text(t) if t.strip() else ""
-                fitz_pages.append(cleaned)
-                if not cleaned.strip():
-                    blank_indices.append(i)
-            fitz_ok = True
-        finally:
-            doc.close()
+        reader = PdfReader(str(path), strict=False)
+        n_all = len(reader.pages)
+        n = n_all if max_pages is None else min(max_pages, n_all)
+        pages: list[str] = []
+        for i in range(n):
+            text = reader.pages[i].extract_text() or ""
+            cleaned = _normalize_extracted_text(text) if text.strip() else ""
+            if cleaned.strip():
+                pages.append(cleaned)
+        return "\n\n".join(pages) if pages else None
     except Exception:
-        _log.debug("fitz extraction failed for %s, falling back to pypdf", path, exc_info=True)
-        fitz_pages = []
-        fitz_ok = False
-
-    # Only run pypdf for pages fitz left blank (or for the whole doc if fitz failed).
-    pypdf_by_index: dict[int, str] = {}
-    need_pypdf = set(blank_indices) if fitz_ok else None  # None = all pages
-    if not fitz_ok or blank_indices:
-        try:
-            from pypdf import PdfReader  # type: ignore
-
-            reader = PdfReader(str(path))
-            n_all = len(reader.pages)
-            n = n_all if max_pages is None else min(max_pages, n_all)
-            for i in range(n):
-                if need_pypdf is None or i in need_pypdf:
-                    t = reader.pages[i].extract_text() or ""
-                    cleaned = _normalize_extracted_text(t) if t.strip() else ""
-                    if cleaned.strip():
-                        pypdf_by_index[i] = cleaned
-        except Exception:
-            _log.debug("pypdf extraction failed for %s", path, exc_info=True)
-
-    if not fitz_pages and not pypdf_by_index:
+        _log.debug("PDF extraction failed for %s", path, exc_info=True)
         return None
-
-    n = len(fitz_pages) if fitz_pages else (max(pypdf_by_index.keys()) + 1 if pypdf_by_index else 0)
-    merged: list[str] = []
-    for i in range(n):
-        page_text = fitz_pages[i] if i < len(fitz_pages) else ""
-        if not page_text.strip() and i in pypdf_by_index:
-            page_text = pypdf_by_index[i]
-        if page_text.strip():
-            merged.append(page_text)
-
-    return "\n\n".join(merged) if merged else None
 
 
 def _read_text_file(path: Path, *, max_bytes: int) -> str:
@@ -722,19 +660,9 @@ def _pages_from_word_estimate(word_count: int, *, per_page: int | None = None) -
 
 def _pdf_page_count(path: Path) -> int | None:
     try:
-        import fitz  # type: ignore  # PyMuPDF
-
-        doc = fitz.open(str(path))
-        try:
-            return int(doc.page_count)
-        finally:
-            doc.close()
-    except Exception:
-        pass
-    try:
         from pypdf import PdfReader  # type: ignore
 
-        return len(PdfReader(str(path)).pages)
+        return len(PdfReader(str(path), strict=False).pages)
     except Exception:
         return None
 

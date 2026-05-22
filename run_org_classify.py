@@ -6,7 +6,7 @@ For every active user in the org:
   Phase B  Per-user LLM classify            (pass-1 fast + pass-2 low-conf re-run)
   Phase C  Per-user full file download      (skipped with --classify-only)
   Phase D  Per-user Gmail fetch             (skipped with --classify-only)
-  Phase E  S3 upload + local delete         (runs after EVERY user, both modes)
+  Phase E  S3 upload + local delete         (runs after EVERY user when S3 is enabled)
 
 Output
 ------
@@ -24,15 +24,18 @@ CSV columns
 Resume behaviour
 ----------------
   Progress is tracked in out/run_state.json per user:
-    pending → scan_done → done → s3_synced  (or error)
+    pending → scan_done → done → s3_synced/local_done  (or error)
   Re-running the same command resumes from the last saved state.
 
 Usage
 -----
   python run_org_classify.py --admin admin@company.com --s3-bucket my-bucket
 
-  # Classify only (no file downloads) — still uploads to S3
+  # Classify only (no file downloads) — still uploads to S3 unless --local-only is used
   python run_org_classify.py --admin admin@company.com --s3-bucket my-bucket --classify-only
+
+  # Keep outputs local, no S3 upload/delete
+  python run_org_classify.py --admin admin@company.com --local-only
 
   # Last 30 days
   python run_org_classify.py --admin admin@company.com --s3-bucket my-bucket --since-days 30
@@ -141,8 +144,9 @@ def _elapsed(t0: float) -> str:
 class RunState:
     PENDING   = "pending"
     SCAN_DONE = "scan_done"   # Drive metadata scan complete, rows cached
-    DONE      = "done"        # classify (+ download) complete, CSVs written
+    DONE      = "done"        # classify (+ download) complete, ready for S3/local finalize
     S3_SYNCED = "s3_synced"   # uploaded to S3 and local data deleted
+    LOCAL_DONE = "local_done" # complete with local output retained
     ERROR     = "error"
 
     def __init__(self, path: Path) -> None:
@@ -179,7 +183,7 @@ class RunState:
         entry = self._data.setdefault(email, {})
         entry["status"] = status
         ts = datetime.utcnow().isoformat() + "Z"
-        if status in (self.DONE, self.ERROR, self.S3_SYNCED, self.SCAN_DONE):
+        if status in (self.DONE, self.ERROR, self.S3_SYNCED, self.SCAN_DONE, self.LOCAL_DONE):
             entry["updated_at"] = ts
         if error:
             entry["error"] = error
@@ -188,14 +192,17 @@ class RunState:
     def get_status(self, email: str) -> str:
         return self._data.get(email, {}).get("status", self.PENDING)
 
-    def is_complete(self, email: str) -> bool:
-        return self.get_status(email) == self.S3_SYNCED
+    def is_complete(self, email: str, *, local_only: bool = False) -> bool:
+        status = self.get_status(email)
+        if local_only:
+            return status in (self.DONE, self.LOCAL_DONE, self.S3_SYNCED)
+        return status == self.S3_SYNCED
 
     def needs_s3_sync(self, email: str) -> bool:
-        return self.get_status(email) == self.DONE
+        return self.get_status(email) in (self.DONE, self.LOCAL_DONE)
 
     def scan_already_done(self, email: str) -> bool:
-        return self.get_status(email) in (self.SCAN_DONE, self.DONE, self.S3_SYNCED)
+        return self.get_status(email) in (self.SCAN_DONE, self.DONE, self.S3_SYNCED, self.LOCAL_DONE)
 
     def summary(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -758,7 +765,7 @@ def _parse_modified_after(since_days: int, modified_after_str: str) -> datetime 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Org-wide Workspace inventory: scan → classify → S3 upload → CSV output.",
+        description="Org-wide Workspace inventory: scan → classify → local/S3 output.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -767,6 +774,9 @@ Examples:
 
   # Classify only (no file downloads) — still uploads results to S3
   python run_org_classify.py --admin admin@co.com --s3-bucket my-bucket --classify-only
+
+  # Local-only output (no S3 upload/delete)
+  python run_org_classify.py --admin admin@co.com --local-only
 
   # Last 30 days
   python run_org_classify.py --admin admin@co.com --s3-bucket my-bucket --since-days 30
@@ -786,6 +796,7 @@ Examples:
     p.add_argument("--sa-file",           default="",                  help="Path to service_account.json (auto-detected if omitted)")
     p.add_argument("--s3-bucket",         default="",                  help="S3 bucket name (omit to keep files local)")
     p.add_argument("--s3-prefix",         default="",                  help="S3 key prefix (auto-generated if omitted)")
+    p.add_argument("--local-only",        action="store_true",         help="Keep outputs local; do not upload to S3 or delete user directories")
     p.add_argument("--pass1-model",       default="",                  help="Fast model for pass-1 (all files)")
     p.add_argument("--pass2-model",       default=default_llm_model(), help="Full model for pass-2 (low-confidence re-run)")
     p.add_argument("--max-files",         type=int, default=0,         help="Cap Drive file count per user (0=unlimited)")
@@ -799,15 +810,18 @@ Examples:
     p.add_argument("--only",              action="append", default=[], metavar="EMAIL",
                    help="Process ONLY this user email (repeatable); all others are skipped")
     p.add_argument("--classify-only",     action="store_true",
-                   help="Skip file downloads and Gmail; classify metadata only (results still uploaded to S3)")
+                   help="Skip file downloads and Gmail; classify metadata only")
     p.add_argument("--gmail",             action="store_true",
-                   help="Fetch Gmail and store raw exports in S3 (off by default; no LLM classification of emails)")
+                   help="Fetch Gmail and store raw exports with the run output (off by default; no LLM classification of emails)")
     p.add_argument("--scan-workers",      type=int, default=4,         metavar="N",
                    help="Parallel threads for Drive metadata scan phase (default: 4)")
     p.add_argument("--extract-workers",  type=int, default=8,         metavar="N",
                    help="Parallel threads for snippet extraction / LLM batching per user (default: 8)")
     p.add_argument("--dry-run",           action="store_true",         help="List users only — do not process")
     args = p.parse_args(argv)
+
+    if args.local_only and args.s3_bucket:
+        p.error("--local-only cannot be used with --s3-bucket")
 
     sa_file        = Path(args.sa_file).expanduser().resolve() if args.sa_file else default_sa_path()
     out_dir        = (_ROOT / args.out).resolve()
@@ -819,12 +833,14 @@ Examples:
     modified_after = _parse_modified_after(args.since_days, args.modified_after)
     classify_only  = args.classify_only
     fetch_gmail    = args.gmail and not classify_only
+    local_only     = args.local_only or not bool(args.s3_bucket)
 
     _log("=" * 60)
     _log(f"workspace-classifier  admin={args.admin}")
     mode_parts = ["classify-only"] if classify_only else ["classify + download"]
     if fetch_gmail:
         mode_parts.append("gmail")
+    mode_parts.append("local-only" if local_only else "s3")
     _log(f"mode={' + '.join(mode_parts) if classify_only else ', '.join(mode_parts)}")
     _log(f"sa_file={sa_file}")
     _log(f"out_dir={out_dir}")
@@ -864,7 +880,7 @@ Examples:
     state.ensure_users(users)
     _log(f"run state: {state.summary()}")
 
-    to_process = [u for u in users if not state.is_complete(u["email"])]
+    to_process = [u for u in users if not state.is_complete(u["email"], local_only=local_only)]
     _log(f"{len(to_process)} users to process")
 
     if not to_process:
@@ -908,7 +924,7 @@ Examples:
             _log(f"{pfx} scan failed — skipping classify")
             continue
 
-        # Already classified but not yet S3-synced (e.g. previous run had no S3)
+        # Already classified locally but not yet S3-synced (e.g. previous run was local-only)
         if state.needs_s3_sync(email) and syncer:
             _log(f"{pfx} already classified — uploading to S3")
             _phase_s3_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx)
@@ -916,7 +932,7 @@ Examples:
             continue
 
         # Already complete
-        if state.is_complete(email):
+        if state.is_complete(email, local_only=local_only):
             continue
 
         _banner(f"USER {i}/{total}: {email}  ({u['name']})")
@@ -982,10 +998,13 @@ Examples:
             _phase_log(pfx, "user", f"all phases done in {_elapsed(t0)}")
             state.set(email, RunState.DONE)
 
-            # Phase E — S3 upload + local delete (ALWAYS, both classify-only and full mode)
+            # Phase E — finalize output
             if syncer:
                 _phase_s3_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx)
                 state.set(email, RunState.S3_SYNCED)
+            else:
+                _phase_log(pfx, "local", f"DONE — output kept at {user_dir}")
+                state.set(email, RunState.LOCAL_DONE)
 
         except KeyboardInterrupt:
             _phase_log(pfx, "user", f"INTERRUPTED after {_elapsed(t0)} — re-run to resume")

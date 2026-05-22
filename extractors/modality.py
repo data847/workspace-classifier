@@ -105,23 +105,17 @@ def _html_has_img_tag(path: Path, *, max_bytes: int = 500_000) -> bool:
 
 def _pdf_has_embedded_images(path: Path, *, max_pages: int = 3) -> bool:
     try:
-        import fitz  # type: ignore  # PyMuPDF
-    except ImportError:
-        return False
-    try:
-        doc = fitz.open(str(path))
-    except Exception:
-        return False
-    try:
-        n = min(max_pages, len(doc))
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(str(path), strict=False)
+        n = min(max_pages, len(reader.pages))
         for i in range(n):
-            if doc[i].get_images(full=True):
+            images = getattr(reader.pages[i], "images", None)
+            if images:
                 return True
         return False
     except Exception:
         return False
-    finally:
-        doc.close()
 
 
 def infer_modalities(path: Path) -> list[str]:
