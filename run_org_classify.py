@@ -1179,6 +1179,16 @@ Examples:
 
         # Skip if scan failed
         if state.get_status(email) == RunState.ERROR:
+            counts = state.scan_counts(email)
+            if counts and counts.get("file_count", 0) == 0:
+                _phase_log(pfx, "classify", "SKIP — previous run found no Drive files")
+                state.set(email, RunState.DONE)
+                if syncer:
+                    _phase_s3_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx)
+                    state.set(email, RunState.S3_SYNCED)
+                else:
+                    state.set(email, RunState.LOCAL_DONE)
+                continue
             _log(f"{pfx} scan failed — skipping classify")
             continue
 
@@ -1216,20 +1226,25 @@ Examples:
                 _record_scan_counts(state, email, scan_rows)
                 _phase_log(pfx, "scan", f"loaded from cache — {file_count} files, {len(scan_rows)} total rows")
 
-            # Phase B — classify
-            evidence_df = _phase_classify(
-                email,
-                scan_rows,
-                user_dir=user_dir,
-                sa_file=sa_file,
-                pass1_model=args.pass1_model or None,
-                pass2_model=args.pass2_model,
-                max_files=max_files,
-                snippet_bytes=args.snippet_bytes,
-                modified_after=modified_after,
-                extract_workers=args.extract_workers,
-                log_prefix=pfx,
-            )
+            file_count = _scan_file_count(scan_rows)
+            if file_count == 0:
+                _phase_log(pfx, "classify", "SKIP — no Drive files found")
+                evidence_df = pd.DataFrame()
+            else:
+                # Phase B — classify
+                evidence_df = _phase_classify(
+                    email,
+                    scan_rows,
+                    user_dir=user_dir,
+                    sa_file=sa_file,
+                    pass1_model=args.pass1_model or None,
+                    pass2_model=args.pass2_model,
+                    max_files=max_files,
+                    snippet_bytes=args.snippet_bytes,
+                    modified_after=modified_after,
+                    extract_workers=args.extract_workers,
+                    log_prefix=pfx,
+                )
 
             # Write CSVs immediately after classify (before download, so we have
             # data even if downloads fail or S3 runs out of space)

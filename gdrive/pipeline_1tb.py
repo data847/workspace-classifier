@@ -567,6 +567,17 @@ def build_inventory_from_drive_1tb(
     if progress_log:
         progress_log(msg)
 
+    if total_files == 0:
+        if progress_log:
+            progress_log("[classify] SKIP — no Drive files found")
+        empty_df = pd.DataFrame()
+        write_company_inventory_workbook(
+            inventory_df=pd.DataFrame(),
+            evidence_df=empty_df,
+            output_path=str(out_path),
+        )
+        return empty_df
+
     # -----------------------------------------------------------------------
     # Phase 2: Extract (download / metadata-only)
     # -----------------------------------------------------------------------
