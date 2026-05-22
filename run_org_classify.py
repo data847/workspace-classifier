@@ -11,6 +11,7 @@ For every active user in the org:
 Output
 ------
   out/org_inventory.csv          Combined CSV — all users, all classified files
+  out/workspace_file_count.json  Total Workspace file count + per-user counts
   out/<user_slug>/inventory.csv  Per-user CSV (also uploaded to S3)
   out/<user_slug>/inventory.xlsx Per-user XLSX (uploaded to S3, then deleted)
 
@@ -36,6 +37,9 @@ Usage
 
   # Keep outputs local, no S3 upload/delete
   python run_org_classify.py --admin admin@company.com --local-only
+
+  # Count files directly from the Drive API, then exit
+  python run_org_classify.py --admin admin@company.com --count-files-only
 
   # Last 30 days
   python run_org_classify.py --admin admin@company.com --s3-bucket my-bucket --since-days 30
@@ -189,6 +193,25 @@ class RunState:
             entry["error"] = error
         self._save()
 
+    def set_scan_counts(self, email: str, *, file_count: int, total_rows: int) -> None:
+        entry = self._data.setdefault(email, {})
+        entry["file_count"] = int(file_count)
+        entry["folder_count"] = max(0, int(total_rows) - int(file_count))
+        entry["total_rows"] = int(total_rows)
+        entry["counts_updated_at"] = datetime.utcnow().isoformat() + "Z"
+        self._save()
+
+    def scan_counts(self, email: str) -> dict[str, int] | None:
+        entry = self._data.get(email, {})
+        try:
+            return {
+                "file_count": int(entry["file_count"]),
+                "folder_count": int(entry.get("folder_count", 0)),
+                "total_rows": int(entry.get("total_rows", entry["file_count"])),
+            }
+        except Exception:
+            return None
+
     def get_status(self, email: str) -> str:
         return self._data.get(email, {}).get("status", self.PENDING)
 
@@ -247,6 +270,89 @@ def _save_scan_rows(user_dir: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     tmp.replace(cache)
+
+
+def _scan_file_count(rows: list[dict[str, Any]]) -> int:
+    return sum(1 for row in rows if not row.get("is_folder"))
+
+
+def _record_scan_counts(state: RunState, email: str, rows: list[dict[str, Any]]) -> None:
+    state.set_scan_counts(email, file_count=_scan_file_count(rows), total_rows=len(rows))
+
+
+def _write_workspace_file_count(
+    out_dir: Path,
+    users: list[dict],
+    state: RunState,
+) -> Path:
+    """Write total Workspace file counts gathered from scan state/caches."""
+    csv_counts: dict[str, int] = {}
+    combined_csv = out_dir / "org_inventory.csv"
+    if combined_csv.is_file():
+        try:
+            with combined_csv.open("r", newline="", encoding="utf-8-sig") as fh:
+                for row in csv.DictReader(fh):
+                    email = str(row.get("user_email") or "").strip()
+                    if email:
+                        csv_counts[email] = csv_counts.get(email, 0) + 1
+        except Exception:
+            csv_counts = {}
+
+    per_user: list[dict[str, Any]] = []
+    missing: list[str] = []
+    total_files = 0
+    total_folders = 0
+    total_rows = 0
+
+    for u in users:
+        email = u["email"]
+        counts = state.scan_counts(email)
+        if counts is None:
+            rows = _load_scan_rows(_user_dir(out_dir, email))
+            if rows:
+                _record_scan_counts(state, email, rows)
+                counts = state.scan_counts(email)
+        source = "scan"
+        if counts is None and email in csv_counts:
+            counts = {
+                "file_count": int(csv_counts[email]),
+                "folder_count": 0,
+                "total_rows": int(csv_counts[email]),
+            }
+            source = "org_inventory.csv"
+        if counts is None:
+            missing.append(email)
+            continue
+
+        file_count = int(counts["file_count"])
+        folder_count = int(counts["folder_count"])
+        row_count = int(counts["total_rows"])
+        total_files += file_count
+        total_folders += folder_count
+        total_rows += row_count
+        per_user.append({
+            "email": email,
+            "name": u.get("name", ""),
+            "org_unit": u.get("org_unit", "/"),
+            "file_count": file_count,
+            "folder_count": folder_count,
+            "total_rows": row_count,
+            "source": source,
+        })
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "total_files": total_files,
+        "total_folders": total_folders,
+        "total_rows": total_rows,
+        "counted_users": len(per_user),
+        "missing_users": missing,
+        "per_user": per_user,
+    }
+    out_path = out_dir / "workspace_file_count.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +478,8 @@ def _scan_one_user(
             )
             rows = _filter_dependency_rows(rows, log_prefix)
             _save_scan_rows(user_dir, rows)
-            file_rows = [r for r in rows if not r.get("is_folder")]
-            _log(f"{log_prefix} [scan] {len(file_rows)} files found (after dependency filter)")
+            file_count = _scan_file_count(rows)
+            _log(f"{log_prefix} [scan] {file_count} files found (after dependency filter)")
             return email, rows
         except Exception as e:
             last_exc = e
@@ -385,6 +491,126 @@ def _scan_one_user(
             else:
                 break
     return email, last_exc
+
+
+def _count_files_for_user(
+    email: str,
+    *,
+    sa_file: Path,
+    max_files: int | None,
+    log_prefix: str,
+) -> tuple[str, dict[str, int] | Exception]:
+    """Count one user's Drive files directly from the Drive API."""
+    try:
+        service = build_drive_service_dwd(email, sa_file=sa_file)
+        rows = walk_drive_folder(
+            service,
+            "root",
+            include_folders=True,
+            max_files=max_files,
+            progress_log=lambda m: _log(f"{log_prefix} {m}"),
+            scan_cache_path=None,
+        )
+        file_count = _scan_file_count(rows)
+        folder_count = max(0, len(rows) - file_count)
+        _log(f"{log_prefix} [count] {file_count} files, {folder_count} folders")
+        return email, {
+            "file_count": file_count,
+            "folder_count": folder_count,
+            "total_rows": len(rows),
+        }
+    except Exception as e:
+        return email, e
+
+
+def run_api_file_count(
+    users: list[dict],
+    *,
+    out_dir: Path,
+    sa_file: Path,
+    max_files: int | None,
+    scan_workers: int,
+    state: RunState,
+) -> Path:
+    """Count Workspace files from Drive API only and write workspace_file_count.json."""
+    total = len(users)
+    _log(f"[count] starting API file count for {total} users with {scan_workers} workers")
+    log_prefix_map = {
+        u["email"]: f"[{i}/{total}][{u['email']}]"
+        for i, u in enumerate(users, 1)
+    }
+    counts_by_email: dict[str, dict[str, int]] = {}
+    errors: dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+        futures = {
+            pool.submit(
+                _count_files_for_user,
+                u["email"],
+                sa_file=sa_file,
+                max_files=max_files,
+                log_prefix=log_prefix_map.get(u["email"], f"[{u['email']}]"),
+            ): u["email"]
+            for u in users
+        }
+        done = 0
+        for fut in as_completed(futures):
+            email = futures[fut]
+            done += 1
+            email_ret, result = fut.result()
+            if isinstance(result, Exception):
+                errors[email] = str(result)
+                _log(f"[count] ERROR {email}: {result}")
+            else:
+                counts_by_email[email_ret] = result
+                state.set_scan_counts(
+                    email_ret,
+                    file_count=result["file_count"],
+                    total_rows=result["total_rows"],
+                )
+                _log(f"[count] {done}/{total} done: {email_ret}")
+
+    per_user: list[dict[str, Any]] = []
+    total_files = 0
+    total_folders = 0
+    total_rows = 0
+    for u in users:
+        email = u["email"]
+        counts = counts_by_email.get(email)
+        if not counts:
+            continue
+        file_count = int(counts["file_count"])
+        folder_count = int(counts["folder_count"])
+        row_count = int(counts["total_rows"])
+        total_files += file_count
+        total_folders += folder_count
+        total_rows += row_count
+        per_user.append({
+            "email": email,
+            "name": u.get("name", ""),
+            "org_unit": u.get("org_unit", "/"),
+            "file_count": file_count,
+            "folder_count": folder_count,
+            "total_rows": row_count,
+            "source": "drive_api",
+        })
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "source": "drive_api",
+        "total_files": total_files,
+        "total_folders": total_folders,
+        "total_rows": total_rows,
+        "counted_users": len(per_user),
+        "error_users": errors,
+        "per_user": per_user,
+    }
+    out_path = out_dir / "workspace_file_count.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _log(f"[count] total files={total_files}, counted_users={len(per_user)}, errors={len(errors)}")
+    _log(f"[count] wrote {out_path}")
+    return out_path
 
 
 def run_concurrent_scan(
@@ -427,6 +653,7 @@ def run_concurrent_scan(
                 state.set(email, RunState.ERROR, error=str(result))
             else:
                 results[email] = result
+                _record_scan_counts(state, email, result)
                 state.set(email, RunState.SCAN_DONE)
                 _log(f"[scan] {done}/{total} done: {email}")
 
@@ -778,6 +1005,9 @@ Examples:
   # Local-only output (no S3 upload/delete)
   python run_org_classify.py --admin admin@co.com --local-only
 
+  # Count files directly from the Drive API, then exit
+  python run_org_classify.py --admin admin@co.com --count-files-only
+
   # Last 30 days
   python run_org_classify.py --admin admin@co.com --s3-bucket my-bucket --since-days 30
 
@@ -809,6 +1039,8 @@ Examples:
                    help="Skip this user email (repeatable)")
     p.add_argument("--only",              action="append", default=[], metavar="EMAIL",
                    help="Process ONLY this user email (repeatable); all others are skipped")
+    p.add_argument("--count-files-only",  action="store_true",
+                   help="Count Drive files directly from the API, write workspace_file_count.json, then exit")
     p.add_argument("--classify-only",     action="store_true",
                    help="Skip file downloads and Gmail; classify metadata only")
     p.add_argument("--gmail",             action="store_true",
@@ -837,10 +1069,14 @@ Examples:
 
     _log("=" * 60)
     _log(f"workspace-classifier  admin={args.admin}")
-    mode_parts = ["classify-only"] if classify_only else ["classify + download"]
+    if args.count_files_only:
+        mode_parts = ["count-files-only"]
+    else:
+        mode_parts = ["classify-only"] if classify_only else ["classify + download"]
     if fetch_gmail:
         mode_parts.append("gmail")
-    mode_parts.append("local-only" if local_only else "s3")
+    if not args.count_files_only:
+        mode_parts.append("local-only" if local_only else "s3")
     _log(f"mode={' + '.join(mode_parts) if classify_only else ', '.join(mode_parts)}")
     _log(f"sa_file={sa_file}")
     _log(f"out_dir={out_dir}")
@@ -880,12 +1116,34 @@ Examples:
     state.ensure_users(users)
     _log(f"run state: {state.summary()}")
 
+    if args.count_files_only:
+        file_count_path = run_api_file_count(
+            users,
+            out_dir=out_dir,
+            sa_file=sa_file,
+            max_files=max_files,
+            scan_workers=args.scan_workers,
+            state=state,
+        )
+        _log(f"file count JSON: {file_count_path}")
+        if syncer and file_count_path.is_file():
+            _log("[s3] uploading workspace_file_count.json")
+            syncer.upload_file(file_count_path, s3_sub_path="")
+        return 0
+
     to_process = [u for u in users if not state.is_complete(u["email"], local_only=local_only)]
     _log(f"{len(to_process)} users to process")
 
     if not to_process:
         _log("all users already complete — nothing to do")
+        file_count_path = _write_workspace_file_count(out_dir, users, state)
+        try:
+            file_count_data = json.loads(file_count_path.read_text(encoding="utf-8"))
+            _log(f"workspace file count: {file_count_data.get('total_files', 0)} files")
+        except Exception:
+            _log(f"workspace file count: {file_count_path}")
         _log(f"combined CSV: {combined_csv}")
+        _log(f"file count JSON: {file_count_path}")
         return 0
 
     # ── Build prefix map for logging ───────────────────────────────────────────
@@ -952,9 +1210,11 @@ Examples:
                 )
                 scan_rows = _filter_dependency_rows(scan_rows, pfx)
                 _save_scan_rows(user_dir, scan_rows)
+                _record_scan_counts(state, email, scan_rows)
             else:
-                file_rows = [r for r in scan_rows if not r.get("is_folder")]
-                _phase_log(pfx, "scan", f"loaded from cache — {len(file_rows)} files, {len(scan_rows)} total rows")
+                file_count = _scan_file_count(scan_rows)
+                _record_scan_counts(state, email, scan_rows)
+                _phase_log(pfx, "scan", f"loaded from cache — {file_count} files, {len(scan_rows)} total rows")
 
             # Phase B — classify
             evidence_df = _phase_classify(
@@ -1017,7 +1277,14 @@ Examples:
     # ── Final summary ─────────────────────────────────────────────────────────
     _log("=" * 60)
     _log(f"all users processed: {state.summary()}")
+    file_count_path = _write_workspace_file_count(out_dir, users, state)
+    try:
+        file_count_data = json.loads(file_count_path.read_text(encoding="utf-8"))
+        _log(f"workspace file count: {file_count_data.get('total_files', 0)} files")
+    except Exception:
+        _log(f"workspace file count: {file_count_path}")
     _log(f"combined CSV: {combined_csv}")
+    _log(f"file count JSON: {file_count_path}")
     if syncer:
         _log(f"S3 output:   s3://{args.s3_bucket}/{syncer.prefix}/")
     _log("=" * 60)
@@ -1026,6 +1293,9 @@ Examples:
     if syncer and combined_csv.is_file():
         _log("[s3] uploading org_inventory.csv")
         syncer.upload_file(combined_csv, s3_sub_path="")
+    if syncer and file_count_path.is_file():
+        _log("[s3] uploading workspace_file_count.json")
+        syncer.upload_file(file_count_path, s3_sub_path="")
 
     # Zip everything remaining in out_dir (combined CSV + run_state + any kept user dirs)
     _banner("Creating output zip archive")

@@ -27,6 +27,7 @@ Progress is tracked in `out/run_state.json` per user (`pending → scan_done →
 ```
 out/
   org_inventory.csv              ← combined CSV, all users (also uploaded to S3 unless local-only)
+  workspace_file_count.json      ← total Workspace file count plus per-user counts
   <user_slug>/inventory.csv      ← per-user CSV
   <user_slug>/inventory.xlsx     ← per-user XLSX (uploaded to S3, then deleted locally unless local-only)
   run_state.json                 ← resume state
@@ -175,6 +176,11 @@ python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --local-only
 
+# Count files directly from the Drive API, then exit
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --count-files-only
+
 # Full mode (classify + download files + fetch Gmail)
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
@@ -199,6 +205,7 @@ python3 run_org_classify.py \
 | `--admin EMAIL` | *(required)* | Google Workspace admin email used for user listing |
 | `--s3-bucket NAME` | *(optional)* | S3 bucket name. Omit to skip S3 upload |
 | `--local-only` | off | Explicitly keep outputs local; cannot be combined with `--s3-bucket` |
+| `--count-files-only` | off | Count files directly from the Drive API, write `workspace_file_count.json`, then exit |
 | `--classify-only` | off | Skip file downloads and Gmail; classify metadata only |
 | `--skip EMAIL` | — | Skip a specific user (repeatable) |
 | `--since-days N` | 0 (all time) | Only process files modified in the last N days |
