@@ -41,6 +41,9 @@ Usage
   # Count files directly from the Drive API, then exit
   python run_org_classify.py --admin admin@company.com --count-files-only
 
+  # Fetch total Workspace storage size via Admin Reports API, then exit
+  python run_org_classify.py --admin admin@company.com --size-only
+
   # Last 30 days
   python run_org_classify.py --admin admin@company.com --s3-bucket my-bucket --since-days 30
 
@@ -61,7 +64,7 @@ import sys
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -613,6 +616,138 @@ def run_api_file_count(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Workspace storage size (Admin Reports API)
+# ---------------------------------------------------------------------------
+
+_REPORTS_SCOPES = ["https://www.googleapis.com/auth/admin.reports.usage.readonly"]
+_REPORTS_LAG_DAYS = (2, 3, 4, 5, 6, 7)
+_REPORTS_USAGE_PARAMS = "accounts:used_quota_in_mb,drive:used_quota_in_mb"
+
+
+def _build_reports_service(admin_email: str, sa_file: Path):
+    """Return an Admin SDK reports_v1 service impersonating ``admin_email`` via DWD."""
+    from googleapiclient.discovery import build
+
+    creds = get_dwd_credentials(admin_email, sa_file=sa_file, scopes=_REPORTS_SCOPES)
+    return build("admin", "reports_v1", credentials=creds, cache_discovery=False)
+
+
+def run_api_storage_size(
+    users: list[dict],
+    *,
+    admin_email: str,
+    out_dir: Path,
+    sa_file: Path,
+) -> Path:
+    """Fetch per-user Workspace storage usage via Admin Reports API.
+
+    Writes ``workspace_storage_size.json`` with total + per-user MB/GB/TB.
+    Single API call per page (~250 users/page), so this is seconds for most orgs.
+
+    Reports lag ~2 days, so we walk back day-by-day until we find a date with data.
+    """
+    reports = _build_reports_service(admin_email, sa_file)
+
+    usage_by_email: dict[str, dict[str, int]] = {}
+    report_date = ""
+    last_err: Exception | None = None
+
+    for offset in _REPORTS_LAG_DAYS:
+        day = (date.today() - timedelta(days=offset)).isoformat()
+        page = None
+        day_usage: dict[str, dict[str, int]] = {}
+        try:
+            while True:
+                resp = reports.userUsageReport().get(
+                    userKey="all",
+                    date=day,
+                    parameters=_REPORTS_USAGE_PARAMS,
+                    pageToken=page,
+                ).execute()
+                for u in resp.get("usageReports", []):
+                    email = u.get("entity", {}).get("userEmail", "")
+                    if not email:
+                        continue
+                    bucket = day_usage.setdefault(email, {"account_mb": 0, "drive_mb": 0})
+                    for p in u.get("parameters", []):
+                        name = p.get("name", "")
+                        val = int(p.get("intValue", 0) or 0)
+                        if name == "accounts:used_quota_in_mb":
+                            bucket["account_mb"] = val
+                        elif name == "drive:used_quota_in_mb":
+                            bucket["drive_mb"] = val
+                page = resp.get("nextPageToken")
+                if not page:
+                    break
+        except Exception as e:
+            last_err = e
+            _log(f"[size] reports for {day} unavailable: {e}")
+            continue
+
+        if day_usage:
+            usage_by_email = day_usage
+            report_date = day
+            _log(f"[size] using report date {day}")
+            break
+
+    if not usage_by_email and last_err is not None:
+        _log(f"[size] no usage data found in last {max(_REPORTS_LAG_DAYS)} days; "
+             f"last error: {last_err}")
+
+    per_user: list[dict[str, Any]] = []
+    total_account_mb = 0
+    total_drive_mb = 0
+    missing: list[str] = []
+    for u in users:
+        email = u["email"]
+        bucket = usage_by_email.get(email)
+        if bucket is None:
+            missing.append(email)
+            account_mb = 0
+            drive_mb = 0
+        else:
+            account_mb = int(bucket.get("account_mb", 0))
+            drive_mb = int(bucket.get("drive_mb", 0))
+        total_account_mb += account_mb
+        total_drive_mb += drive_mb
+        per_user.append({
+            "email": email,
+            "name": u.get("name", ""),
+            "org_unit": u.get("org_unit", "/"),
+            "account_used_mb": account_mb,
+            "account_used_gb": round(account_mb / 1024, 3),
+            "drive_used_mb": drive_mb,
+            "drive_used_gb": round(drive_mb / 1024, 3),
+        })
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "source": "admin_reports_api",
+        "report_date": report_date,
+        "admin": admin_email,
+        "user_count": len(users),
+        "users_with_data": len(users) - len(missing),
+        "users_missing_data": missing,
+        "total_account_used_mb": total_account_mb,
+        "total_account_used_gb": round(total_account_mb / 1024, 3),
+        "total_account_used_tb": round(total_account_mb / 1024 / 1024, 3),
+        "total_drive_used_mb": total_drive_mb,
+        "total_drive_used_gb": round(total_drive_mb / 1024, 3),
+        "total_drive_used_tb": round(total_drive_mb / 1024 / 1024, 3),
+        "per_user": per_user,
+    }
+    out_path = out_dir / "workspace_storage_size.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _log(
+        f"[size] total Workspace storage: {total_account_mb/1024:.2f} GiB "
+        f"(Drive only: {total_drive_mb/1024:.2f} GiB) across {len(users)} users"
+    )
+    _log(f"[size] wrote {out_path}")
+    return out_path
+
+
 def run_concurrent_scan(
     users_to_scan: list[dict],
     *,
@@ -1008,6 +1143,9 @@ Examples:
   # Count files directly from the Drive API, then exit
   python run_org_classify.py --admin admin@co.com --count-files-only
 
+  # Fetch total Workspace storage size via Admin Reports API, then exit
+  python run_org_classify.py --admin admin@co.com --size-only
+
   # Last 30 days
   python run_org_classify.py --admin admin@co.com --s3-bucket my-bucket --since-days 30
 
@@ -1041,6 +1179,9 @@ Examples:
                    help="Process ONLY this user email (repeatable); all others are skipped")
     p.add_argument("--count-files-only",  action="store_true",
                    help="Count Drive files directly from the API, write workspace_file_count.json, then exit")
+    p.add_argument("--size-only",         action="store_true",
+                   help="Fetch total Workspace storage size via Admin Reports API, "
+                        "write workspace_storage_size.json, then exit")
     p.add_argument("--classify-only",     action="store_true",
                    help="Skip file downloads and Gmail; classify metadata only")
     p.add_argument("--gmail",             action="store_true",
@@ -1054,6 +1195,8 @@ Examples:
 
     if args.local_only and args.s3_bucket:
         p.error("--local-only cannot be used with --s3-bucket")
+    if args.size_only and args.count_files_only:
+        p.error("--size-only cannot be combined with --count-files-only")
 
     sa_file        = Path(args.sa_file).expanduser().resolve() if args.sa_file else default_sa_path()
     out_dir        = (_ROOT / args.out).resolve()
@@ -1071,11 +1214,13 @@ Examples:
     _log(f"workspace-classifier  admin={args.admin}")
     if args.count_files_only:
         mode_parts = ["count-files-only"]
+    elif args.size_only:
+        mode_parts = ["size-only"]
     else:
         mode_parts = ["classify-only"] if classify_only else ["classify + download"]
     if fetch_gmail:
         mode_parts.append("gmail")
-    if not args.count_files_only:
+    if not args.count_files_only and not args.size_only:
         mode_parts.append("local-only" if local_only else "s3")
     _log(f"mode={' + '.join(mode_parts) if classify_only else ', '.join(mode_parts)}")
     _log(f"sa_file={sa_file}")
@@ -1129,6 +1274,19 @@ Examples:
         if syncer and file_count_path.is_file():
             _log("[s3] uploading workspace_file_count.json")
             syncer.upload_file(file_count_path, s3_sub_path="")
+        return 0
+
+    if args.size_only:
+        size_path = run_api_storage_size(
+            users,
+            admin_email=args.admin,
+            out_dir=out_dir,
+            sa_file=sa_file,
+        )
+        _log(f"storage size JSON: {size_path}")
+        if syncer and size_path.is_file():
+            _log("[s3] uploading workspace_storage_size.json")
+            syncer.upload_file(size_path, s3_sub_path="")
         return 0
 
     to_process = [u for u in users if not state.is_complete(u["email"], local_only=local_only)]
