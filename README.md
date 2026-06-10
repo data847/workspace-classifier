@@ -210,6 +210,13 @@ python3 run_org_classify.py \
   --user user@yourdomain.com \
   --s3-bucket your-s3-bucket
 
+# Export only — download Drive + Gmail to S3 (no LLM classification)
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --export-only \
+  --s3-bucket your-s3-bucket
+
 # Dry run — list users only, no processing
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
@@ -232,6 +239,7 @@ python3 run_org_classify.py \
 | `--count-files-only` | off | Count files directly from the Drive API, write `workspace_file_count.json`, then exit |
 | `--size-only` | off | Fetch total Workspace storage size via Admin Reports API, write `workspace_storage_size.json`, then exit |
 | `--classify-only` | off | Skip file downloads and Gmail; classify metadata only |
+| `--export-only` | off | Download Drive + Gmail and upload to S3; skip LLM classification |
 | `--user EMAIL` | — | Process one user only (Drive + Gmail); skips org-wide listing |
 | `--gmail` | off | Fetch Gmail exports (auto-enabled with `--s3-bucket` or `--user`) |
 | `--no-gmail` | off | Skip Gmail even when S3/single-user mode would enable it |

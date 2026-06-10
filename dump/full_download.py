@@ -79,6 +79,13 @@ def _safe_name(name: str, max_len: int = 200) -> str:
     return name[:max_len] or "unnamed"
 
 
+def _safe_path_parts(path: str) -> Path:
+    parts = [p for p in path.split("/") if p and p != "."]
+    if not parts:
+        return Path()
+    return Path(*[_safe_name(part) for part in parts])
+
+
 def _backoff(attempt: int) -> None:
     time.sleep(min(120.0, 0.75 * (2 ** attempt)))
 
@@ -250,3 +257,100 @@ def download_all_by_bucket(
 
     _log(f"[dump] full download complete — {sum(counts.values())} files across {len(counts)} buckets")
     return counts
+
+
+def download_all_from_scan(
+    service: Any,
+    scan_rows: list[dict[str, Any]],
+    *,
+    out_dir: Path,
+    log: Any = None,
+) -> int:
+    """Download every file from Drive scan rows, preserving folder paths.
+
+    Files are written to ``out_dir/files/<path>/`` where ``path`` comes from the
+    scan row. No LLM classification or bucket grouping is performed.
+    """
+    files_dir = out_dir / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    file_rows = [
+        row for row in scan_rows
+        if not row.get("is_folder") and not row.get("is_shortcut")
+    ]
+    total = len(file_rows)
+    downloaded = 0
+
+    for i, row in enumerate(file_rows, 1):
+        file_id = str(row.get("drive_file_id") or "")
+        mime = str(row.get("mime_type") or "")
+        filename = str(row.get("name") or "file")
+        path = str(row.get("path") or "/").strip("/")
+        size_b = row.get("size_bytes")
+
+        if i % 100 == 0:
+            _log(f"[dump] {i}/{total} files processed")
+
+        rel_dir = files_dir / _safe_path_parts(path) if path else files_dir
+        rel_dir.mkdir(parents=True, exist_ok=True)
+
+        if not file_id:
+            stub = rel_dir / f"{_safe_name(filename)}.stub.txt"
+            stub.write_text(
+                f"missing_file_id\nfilename: {filename}\nmime: {mime}\npath: {path}\n",
+                encoding="utf-8",
+            )
+            downloaded += 1
+            continue
+
+        if _is_binary(mime):
+            size_str = f"{int(size_b):,} bytes" if size_b else "unknown size"
+            stub = rel_dir / f"{_safe_name(filename)}.stub.txt"
+            stub.write_text(
+                f"[binary file — not downloaded]\n"
+                f"filename : {filename}\n"
+                f"mime_type: {mime}\n"
+                f"size     : {size_str}\n"
+                f"drive_id : {file_id}\n"
+                f"path     : {path}\n",
+                encoding="utf-8",
+            )
+            downloaded += 1
+            continue
+
+        export_info = _GOOGLE_EXPORT_MIME.get(mime)
+        if export_info:
+            _, ext = export_info
+            base = Path(filename).stem
+        else:
+            base = Path(filename).stem
+            ext = Path(filename).suffix or ".bin"
+
+        safe_base = _safe_name(base)
+        dest = rel_dir / f"{safe_base}{ext}"
+        if dest.exists():
+            dest = rel_dir / f"{safe_base}_{file_id[:8]}{ext}"
+
+        err = _download_one(
+            service,
+            file_id=file_id,
+            mime_type=mime,
+            display_name=filename,
+            dest=dest,
+        )
+        if err:
+            _log(f"[dump] warn: {filename} ({file_id[:8]}) — {err}")
+            stub = rel_dir / f"{safe_base}.error.txt"
+            stub.write_text(
+                f"download_error: {err}\nfile_id: {file_id}\nmime: {mime}\npath: {path}\n",
+                encoding="utf-8",
+            )
+
+        downloaded += 1
+
+    _log(f"[dump] export download complete — {downloaded} files")
+    return downloaded

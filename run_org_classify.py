@@ -50,6 +50,9 @@ Usage
   # Single user — Drive classify + download + Gmail (no org-wide user listing)
   python run_org_classify.py --admin admin@company.com --user user@company.com --local-only
 
+  # Export only — download Drive + Gmail, push to S3 (no LLM classification)
+  python run_org_classify.py --admin admin@company.com --user user@company.com --export-only --s3-bucket my-bucket
+
   # Dry run: list users, don't process
   python run_org_classify.py --admin admin@company.com --dry-run
 
@@ -106,7 +109,7 @@ from checkpoint import (
 from subcategory_classifier import subcategory_checkpoint_path
 
 try:
-    from dump.full_download import download_all_by_bucket
+    from dump.full_download import download_all_by_bucket, download_all_from_scan
     from dump.sample_selector import select_and_download_samples
     _DOWNLOAD_AVAILABLE = True
 except ImportError:
@@ -281,6 +284,41 @@ def _save_scan_rows(user_dir: Path, rows: list[dict[str, Any]]) -> None:
 
 def _scan_file_count(rows: list[dict[str, Any]]) -> int:
     return sum(1 for row in rows if not row.get("is_folder"))
+
+
+def _filter_rows_by_modified_after(
+    rows: list[dict[str, Any]],
+    modified_after: datetime,
+) -> list[dict[str, Any]]:
+    """Keep rows whose ``modified_time`` is on or after ``modified_after``."""
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        mt = row.get("modified_time")
+        if not mt:
+            filtered.append(row)
+            continue
+        try:
+            dt = datetime.fromisoformat(str(mt).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= modified_after:
+                filtered.append(row)
+        except Exception:
+            filtered.append(row)
+    return filtered
+
+
+def _export_file_rows(
+    scan_rows: list[dict[str, Any]],
+    modified_after: datetime | None,
+) -> list[dict[str, Any]]:
+    rows = [
+        row for row in scan_rows
+        if not row.get("is_folder") and not row.get("is_shortcut")
+    ]
+    if modified_after is not None:
+        rows = _filter_rows_by_modified_after(rows, modified_after)
+    return rows
 
 
 def _record_scan_counts(state: RunState, email: str, rows: list[dict[str, Any]]) -> None:
@@ -904,6 +942,46 @@ def _phase_classify(
 # Phase C: Full file download
 # ---------------------------------------------------------------------------
 
+def _phase_export_download(
+    email: str,
+    scan_rows: list[dict[str, Any]],
+    *,
+    user_dir: Path,
+    sa_file: Path,
+    modified_after: datetime | None,
+    log_prefix: str,
+) -> None:
+    if not _DOWNLOAD_AVAILABLE:
+        _phase_log(log_prefix, "download", "SKIP — dump.full_download not available")
+        return
+
+    file_rows = _export_file_rows(scan_rows, modified_after)
+    if not file_rows:
+        _phase_log(log_prefix, "download", "SKIP — no Drive files to export")
+        return
+
+    t0 = time.time()
+    _phase_log(
+        log_prefix,
+        "download",
+        f"START — exporting {len(file_rows)} Drive files → {user_dir / 'dump' / 'files'}",
+    )
+    service = build_drive_service_dwd(email, sa_file=sa_file)
+    download_all_from_scan(
+        service,
+        file_rows,
+        out_dir=user_dir / "dump",
+        log=lambda m: _log(f"{log_prefix} {m}"),
+    )
+    dump_dir = user_dir / "dump" / "files"
+    if dump_dir.exists():
+        n_files = sum(1 for _ in dump_dir.rglob("*") if _.is_file())
+        total_mb = sum(f.stat().st_size for f in dump_dir.rglob("*") if f.is_file()) / 1_048_576
+        _phase_log(log_prefix, "download", f"DONE — {n_files} files, {total_mb:.1f} MB in {_elapsed(t0)}")
+    else:
+        _phase_log(log_prefix, "download", f"DONE in {_elapsed(t0)}")
+
+
 def _phase_download(
     email: str,
     evidence_df: pd.DataFrame,
@@ -1211,6 +1289,8 @@ Examples:
                         "write workspace_storage_size.json, then exit")
     p.add_argument("--classify-only",     action="store_true",
                    help="Skip file downloads and Gmail; classify metadata only")
+    p.add_argument("--export-only",       action="store_true",
+                   help="Download Drive + Gmail and upload to S3; skip LLM classification")
     p.add_argument("--gmail",             action="store_true",
                    help="Fetch Gmail and store raw exports (auto-enabled with --s3-bucket or --user)")
     p.add_argument("--no-gmail",          action="store_true",
@@ -1230,6 +1310,8 @@ Examples:
         p.error("--user and --only cannot be used together")
     if args.gmail and args.no_gmail:
         p.error("--gmail and --no-gmail cannot be used together")
+    if args.export_only and args.classify_only:
+        p.error("--export-only cannot be used with --classify-only")
 
     sa_file        = Path(args.sa_file).expanduser().resolve() if args.sa_file else default_sa_path()
     out_dir        = (_ROOT / args.out).resolve()
@@ -1242,10 +1324,11 @@ Examples:
         only_set = {args.user.strip()}
     modified_after = _parse_modified_after(args.since_days, args.modified_after)
     classify_only  = args.classify_only
+    export_only    = args.export_only
     fetch_gmail    = (
         not classify_only
         and not args.no_gmail
-        and (args.gmail or bool(args.user) or bool(args.s3_bucket))
+        and (export_only or args.gmail or bool(args.user) or bool(args.s3_bucket))
     )
     local_only     = args.local_only or not bool(args.s3_bucket)
 
@@ -1255,13 +1338,15 @@ Examples:
         mode_parts = ["count-files-only"]
     elif args.size_only:
         mode_parts = ["size-only"]
+    elif export_only:
+        mode_parts = ["export-only"]
     else:
         mode_parts = ["classify-only"] if classify_only else ["classify + download"]
     if fetch_gmail:
         mode_parts.append("gmail")
     if not args.count_files_only and not args.size_only:
         mode_parts.append("local-only" if local_only else "s3")
-    _log(f"mode={' + '.join(mode_parts) if classify_only else ', '.join(mode_parts)}")
+    _log(f"mode={', '.join(mode_parts)}")
     _log(f"sa_file={sa_file}")
     _log(f"out_dir={out_dir}")
     _log(f"s3_bucket={args.s3_bucket or '(none — local only)'}")
@@ -1435,43 +1520,17 @@ Examples:
                 _phase_log(pfx, "scan", f"loaded from cache — {file_count} files, {len(scan_rows)} total rows")
 
             file_count = _scan_file_count(scan_rows)
-            if file_count == 0:
-                _phase_log(pfx, "classify", "SKIP — no Drive files found")
-                evidence_df = pd.DataFrame()
-            else:
-                # Phase B — classify
-                evidence_df = _phase_classify(
+
+            if export_only:
+                _phase_log(pfx, "classify", "SKIP — export-only mode (no LLM classification)")
+                _phase_export_download(
                     email,
                     scan_rows,
                     user_dir=user_dir,
                     sa_file=sa_file,
-                    pass1_model=args.pass1_model or None,
-                    pass2_model=args.pass2_model,
-                    max_files=max_files,
-                    snippet_bytes=args.snippet_bytes,
                     modified_after=modified_after,
-                    extract_workers=args.extract_workers,
                     log_prefix=pfx,
                 )
-
-            # Write CSVs immediately after classify (before download, so we have
-            # data even if downloads fail or S3 runs out of space)
-            _phase_log(pfx, "csv", f"writing per-user CSV + appending to combined CSV")
-            _write_user_csv(email, evidence_df, user_dir, combined_csv)
-
-            if not classify_only:
-                # Phase C — full file download (requires classified evidence)
-                if not evidence_df.empty:
-                    _phase_download(
-                        email, evidence_df,
-                        user_dir=user_dir,
-                        sa_file=sa_file,
-                        log_prefix=pfx,
-                    )
-                elif file_count > 0:
-                    _phase_log(pfx, "download", "SKIP — no classified evidence rows")
-
-                # Phase D — Gmail (auto-enabled with --s3-bucket or --user)
                 if fetch_gmail:
                     _phase_gmail(
                         email,
@@ -1480,6 +1539,52 @@ Examples:
                         modified_after=modified_after,
                         log_prefix=pfx,
                     )
+            else:
+                if file_count == 0:
+                    _phase_log(pfx, "classify", "SKIP — no Drive files found")
+                    evidence_df = pd.DataFrame()
+                else:
+                    # Phase B — classify
+                    evidence_df = _phase_classify(
+                        email,
+                        scan_rows,
+                        user_dir=user_dir,
+                        sa_file=sa_file,
+                        pass1_model=args.pass1_model or None,
+                        pass2_model=args.pass2_model,
+                        max_files=max_files,
+                        snippet_bytes=args.snippet_bytes,
+                        modified_after=modified_after,
+                        extract_workers=args.extract_workers,
+                        log_prefix=pfx,
+                    )
+
+                # Write CSVs immediately after classify (before download, so we have
+                # data even if downloads fail or S3 runs out of space)
+                _phase_log(pfx, "csv", f"writing per-user CSV + appending to combined CSV")
+                _write_user_csv(email, evidence_df, user_dir, combined_csv)
+
+                if not classify_only:
+                    # Phase C — full file download (requires classified evidence)
+                    if not evidence_df.empty:
+                        _phase_download(
+                            email, evidence_df,
+                            user_dir=user_dir,
+                            sa_file=sa_file,
+                            log_prefix=pfx,
+                        )
+                    elif file_count > 0:
+                        _phase_log(pfx, "download", "SKIP — no classified evidence rows")
+
+                    # Phase D — Gmail (auto-enabled with --s3-bucket or --user)
+                    if fetch_gmail:
+                        _phase_gmail(
+                            email,
+                            user_dir=user_dir,
+                            sa_file=sa_file,
+                            modified_after=modified_after,
+                            log_prefix=pfx,
+                        )
 
             _phase_log(pfx, "user", f"all phases done in {_elapsed(t0)}")
             state.set(email, RunState.DONE)
@@ -1515,8 +1620,8 @@ Examples:
         _log(f"S3 output:   s3://{args.s3_bucket}/{syncer.prefix}/")
     _log("=" * 60)
 
-    # Upload combined CSV to S3 root
-    if syncer and combined_csv.is_file():
+    # Upload combined CSV to S3 root (classification runs only)
+    if syncer and not export_only and combined_csv.is_file():
         _log("[s3] uploading org_inventory.csv")
         syncer.upload_file(combined_csv, s3_sub_path="")
     if syncer and file_count_path.is_file():
