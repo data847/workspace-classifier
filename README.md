@@ -1,52 +1,117 @@
 # workspace-classifier
 
-Org-wide Google Workspace inventory pipeline. Scans every active user's Drive, classifies files using an LLM, and exports a single combined CSV. Results can be uploaded to S3 with local cleanup, or kept entirely local with `--local-only`.
+Google Workspace data pipeline for org-wide or single-user runs. It can:
+
+- **Classify** every user's Drive files with an LLM and export inventory CSVs
+- **Export** raw Drive files and Gmail to S3 (no LLM)
+- **Upload** results to S3 with optional local cleanup
+
+---
+
+## Modes at a glance
+
+| Mode | Command | Classify? | Download Drive? | Gmail? | S3? | LLM key needed? |
+|------|---------|-----------|-----------------|--------|-----|-----------------|
+| **Full classify** | `--s3-bucket` | Yes | Yes (classified files) | Yes | Yes | Yes |
+| **Export only** | `--export-only --s3-bucket` | No | Yes (all scanned files) | Yes | Yes | No |
+| **Classify only** | `--classify-only --s3-bucket` | Yes | No | No | Yes (metadata only) | Yes |
+| **Local** | `--local-only` | Yes | Yes | With `--gmail` / `--user` | No | Yes |
+
+**Most common for data migration (Drive + email → S3, no classification):**
+
+```bash
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --export-only \
+  --s3-bucket your-s3-bucket
+```
 
 ---
 
 ## How it works
 
-For every active user in the org the pipeline runs five phases in order:
+### Full classify mode (default with `--s3-bucket`)
+
+For every active user in the org:
 
 | Phase | What it does |
 |---|---|
-| **A — Scan** | Concurrent Drive metadata walk for all users (parallel threads). Dependency files (`node_modules`, `venv`, `site-packages`, etc.) are filtered out automatically. |
-| **B — Classify** | Two-pass LLM classification per user. Pass 1 uses a fast/cheap model on all files; Pass 2 re-runs a full model on any low-confidence results. |
-| **C — Download** | Full file download per user *(skipped with `--classify-only`)* |
-| **D — Gmail** | Fetch + export emails per user *(skipped with `--classify-only`)* |
-| **E — Output finalize** | Upload results to S3 and delete local data, or keep user outputs locally when running with `--local-only` / no S3 bucket. |
+| **A — Scan** | Concurrent Drive metadata walk (parallel threads). Dependency folders (`node_modules`, `venv`, etc.) are filtered out. |
+| **B — Classify** | Two-pass LLM classification. Pass 1 uses a fast model; Pass 2 re-runs a full model on low-confidence results. |
+| **C — Download** | Full Drive file download, organised by LLM bucket. |
+| **D — Gmail** | Fetch emails, attachments, and metadata. Auto-enabled when `--s3-bucket` or `--user` is set. |
+| **E — S3 sync** | Upload user output to S3, then delete local copies. |
+
+### Export-only mode (`--export-only`)
+
+Skips LLM classification entirely. For each user:
+
+1. **Scan** Drive metadata
+2. **Download** all scanned Drive files → `dump/files/` (preserves folder paths)
+3. **Fetch** Gmail → `dump/emails/`
+4. **Upload** to S3 and delete local data
+
+No `inventory.csv`, no `org_inventory.csv`, no Anthropic/OpenAI API key required.
 
 ### Resume behaviour
 
-Progress is tracked in `out/run_state.json` per user (`pending → scan_done → done → s3_synced` for S3 runs, or `local_done` for local-only runs). Re-running the exact same command resumes from where it stopped — already-completed users are skipped.
+Progress is tracked in `out/run_state.json` per user:
+
+```text
+pending → scan_done → done → s3_synced   (S3 runs)
+pending → scan_done → done → local_done  (local-only runs)
+```
+
+Re-running the exact same command resumes from where it stopped — already-completed users are skipped.
 
 ---
 
 ## Output
 
-```
+### Classify mode
+
+```text
 out/
-  org_inventory.csv              ← combined CSV, all users (also uploaded to S3 unless local-only)
-  workspace_file_count.json      ← total Workspace file count plus per-user counts
-  workspace_storage_size.json    ← total Workspace storage size (MB/GB/TB) plus per-user usage
-  <user_slug>/inventory.csv      ← per-user CSV
-  <user_slug>/inventory.xlsx     ← per-user XLSX (uploaded to S3, then deleted locally unless local-only)
-  <user_slug>/dump/files/        ← full Drive downloads (uploaded to S3, then deleted locally)
-  <user_slug>/dump/emails/       ← Gmail export JSON/CSV/attachments (uploaded to S3, then deleted locally)
+  org_inventory.csv              ← combined CSV, all users
+  workspace_file_count.json      ← total file count + per-user counts
+  workspace_storage_size.json    ← storage usage (from --size-only)
+  <user_slug>/inventory.csv      ← per-user classified inventory
+  <user_slug>/inventory.xlsx     ← per-user XLSX
+  <user_slug>/dump/files/        ← Drive downloads (by LLM bucket)
+  <user_slug>/dump/emails/       ← Gmail exports
   run_state.json                 ← resume state
 ```
 
-When `--s3-bucket` is set, each user's output is uploaded to:
+### Export-only mode
 
 ```text
-s3://<bucket>/<org>_<date>/<user_slug>/inventory.csv
+out/
+  workspace_file_count.json      ← file counts
+  <user_slug>/dump/files/        ← all Drive files (by folder path)
+  <user_slug>/dump/emails/       ← Gmail exports
+    emails_all.json              ← all messages with full body text
+    emails_metadata.csv          ← id, subject, sender, date, attachments
+    email_<n>.txt                ← individual email bodies
+    attachments/<msg_id>/        ← raw attachment files
+  run_state.json
+```
+
+### S3 layout
+
+When `--s3-bucket` is set, the S3 prefix is auto-generated as `<org>_<YYYY-MM-DD>`:
+
+```text
+s3://<bucket>/<org>_<date>/org_inventory.csv          ← classify mode only
+s3://<bucket>/<org>_<date>/workspace_file_count.json
+s3://<bucket>/<org>_<date>/<user_slug>/inventory.csv  ← classify mode only
 s3://<bucket>/<org>_<date>/<user_slug>/dump/files/...
 s3://<bucket>/<org>_<date>/<user_slug>/dump/emails/...
 ```
 
-Org-level files (`org_inventory.csv`, `workspace_file_count.json`) are uploaded to the prefix root.
+Local user directories are deleted after a successful S3 upload. Use `--local-only` to keep files on disk.
 
-### CSV columns
+### CSV columns (classify mode)
 
 `user_email` · `Item Name` · `File Type` · `Content Summary` · `PII Flag` · `Size` · `Word Count` · `LLM Tokens` · `Page Count` · `Modality` · `Content Type` · `Quality tier` · `What is contained` · `Source` · `Path / Subsection` · `bucket_number` · `bucket_name` · `Sub-category` · `confidence` · `rationale`
 
@@ -57,13 +122,13 @@ Org-level files (`org_inventory.csv`, `workspace_file_count.json`) are uploaded 
 ### 1. Prerequisites
 
 - Python 3.10+
-- A Google Cloud **service account** with **Domain-Wide Delegation** enabled and the following scopes granted in Google Admin:
+- Google Cloud **service account** with **Domain-Wide Delegation** and these Admin-authorized scopes:
   - `https://www.googleapis.com/auth/drive.readonly`
   - `https://www.googleapis.com/auth/admin.directory.user.readonly`
   - `https://www.googleapis.com/auth/admin.reports.usage.readonly`
-  - `https://www.googleapis.com/auth/gmail.readonly` *(only needed for full mode)*
-- An Anthropic or OpenAI API key
-- AWS credentials with `s3:PutObject` access *(only needed for `--s3-bucket`)*
+  - `https://www.googleapis.com/auth/gmail.readonly` *(needed for Gmail export)*
+- Anthropic or OpenAI API key *(classify mode only — not needed for `--export-only`)*
+- AWS credentials with `s3:PutObject` access *(needed for `--s3-bucket`)*
 
 ### 2. Install dependencies
 
@@ -77,90 +142,36 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and fill in:
+Edit `.env`:
 
 ```env
-# LLM — pick one
+# LLM — only needed for classify mode (not --export-only)
 ANTHROPIC_API_KEY=sk-ant-...
 # or
 OPENAI_API_KEY=sk-proj-...
 LLM_PROVIDER=openai
 
-# Google service account (place the JSON file in this directory)
+# Google service account
 GOOGLE_SERVICE_ACCOUNT_FILE=service_account.json
 
-# AWS (only needed for --s3-bucket)
+# AWS — only needed for --s3-bucket
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
 ```
 
-### 4. Add service account key
+### 4. Service account setup
 
-Place your service account JSON file in the `workspace-classifier/` directory and name it `service_account.json` (or set `GOOGLE_SERVICE_ACCOUNT_FILE` in `.env` to its path).
+1. Enable **Google Drive API**, **Admin SDK API**, and **Gmail API** in Google Cloud Console.
+2. Create a service account with **Domain-Wide Delegation** enabled.
+3. Download the JSON key as `service_account.json`.
+4. In Google Admin Console → **Security > API controls > Domain-wide delegation**, authorize the service account Client ID with the scopes listed above.
 
-### 5. Generate and authorize a service account
+The `--admin` account must be a Workspace Super Admin (or delegated admin with user/reports read access).
 
-This project uses a Google service account with Domain-Wide Delegation (DWD). The service account JSON key is used locally to mint runtime OAuth access tokens while impersonating users in your Google Workspace domain.
+#### Security
 
-#### Required Google Cloud APIs
-
-Enable these APIs in the Google Cloud project that owns the service account:
-
-- Google Drive API
-- Admin SDK API
-- Gmail API *(only needed for full mode / Gmail extraction)*
-
-#### Required Google Cloud permissions
-
-The person setting this up needs enough Google Cloud IAM permissions to enable APIs, create service accounts, and create service account keys. Typical roles are:
-
-- `Service Usage Admin`
-- `Service Account Admin`
-- `Service Account Key Admin`
-
-A project `Owner` can also perform these steps.
-
-#### Required Google Workspace permissions
-
-The person authorizing Domain-Wide Delegation in Google Admin Console must be a Google Workspace Super Admin.
-
-The `--admin` account used when running the tool should be a Super Admin or delegated admin with read access to users and reports.
-
-#### Service account setup steps
-
-1. In Google Cloud Console, create or select the project for this tool.
-2. Enable the required APIs listed above.
-3. Go to `IAM & Admin > Service Accounts`.
-4. Create a service account, for example `workspace-classifier`.
-5. Open the service account details and enable Domain-Wide Delegation.
-6. Copy the service account OAuth Client ID.
-7. Go to `Keys > Add Key > Create new key > JSON`.
-8. Download the JSON key and save it securely as `service_account.json`, or set `GOOGLE_SERVICE_ACCOUNT_FILE` to its path.
-
-#### Domain-Wide Delegation authorization
-
-In Google Admin Console, go to:
-
-```text
-Security > Access and data control > API controls > Domain-wide delegation
-```
-
-Add a new API client using the service account OAuth Client ID, then authorize these scopes:
-
-```text
-https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/admin.reports.usage.readonly,https://www.googleapis.com/auth/gmail.readonly
-```
-
-If Gmail extraction is not required, omit:
-
-```text
-https://www.googleapis.com/auth/gmail.readonly
-```
-
-#### Security notes
-
-Do not commit these files to git:
+Do not commit these files:
 
 ```text
 service_account.json
@@ -169,8 +180,6 @@ credentials.json
 tokens
 ```
 
-Rotate the service account key if it is exposed, and keep the authorized scope list as small as your workflow allows.
-
 ---
 
 ## Usage
@@ -178,78 +187,106 @@ Rotate the service account key if it is exposed, and keep the authorized scope l
 ```bash
 cd workspace-classifier/
 
-# Classify only (fast — no file downloads, still uploads to S3)
-python3 run_org_classify.py \
-  --admin admin@yourdomain.com \
-  --s3-bucket your-s3-bucket \
-  --classify-only
+# ── Export only: Drive + Gmail → S3 (no LLM) ──────────────────────────────
 
-# Local-only mode — no S3 upload, keeps per-user output directories
-python3 run_org_classify.py \
-  --admin admin@yourdomain.com \
-  --local-only
-
-# Count files directly from the Drive API, then exit
-python3 run_org_classify.py \
-  --admin admin@yourdomain.com \
-  --count-files-only
-
-# Fetch total Workspace storage size via Admin Reports API, then exit
-python3 run_org_classify.py \
-  --admin admin@yourdomain.com \
-  --size-only
-
-# Full mode — classify, download Drive files, fetch Gmail, upload all to S3
-python3 run_org_classify.py \
-  --admin admin@yourdomain.com \
-  --s3-bucket your-s3-bucket
-
-# Single user — Drive + Gmail → S3
-python3 run_org_classify.py \
-  --admin admin@yourdomain.com \
-  --user user@yourdomain.com \
-  --s3-bucket your-s3-bucket
-
-# Export only — download Drive + Gmail to S3 (no LLM classification)
+# Single user
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --user user@yourdomain.com \
   --export-only \
   --s3-bucket your-s3-bucket
 
-# Dry run — list users only, no processing
+# Whole org
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
-  --dry-run
+  --export-only \
+  --s3-bucket your-s3-bucket
 
-# Resume a stopped run — just re-run the exact same command
+# Last 30 days only
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --export-only \
+  --s3-bucket your-s3-bucket \
+  --since-days 30
+
+# ── Full classify: LLM + Drive + Gmail → S3 ──────────────────────────────
+
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --s3-bucket your-s3-bucket
+
+# Single user with classification
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --s3-bucket your-s3-bucket
+
+# ── Classify only (metadata, no file downloads) ──────────────────────────
+
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --s3-bucket your-s3-bucket \
   --classify-only
+
+# ── Local output (no S3) ─────────────────────────────────────────────────
+
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --export-only \
+  --local-only
+
+# ── Utility commands ─────────────────────────────────────────────────────
+
+# Count Drive files across the org, then exit
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --count-files-only
+
+# Fetch total Workspace storage size, then exit
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --size-only
+
+# List users without processing
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --dry-run
+
+# Resume a stopped run — re-run the exact same command
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --export-only \
+  --s3-bucket your-s3-bucket
 ```
 
 ### All flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--admin EMAIL` | *(required)* | Google Workspace admin email used for user listing |
-| `--s3-bucket NAME` | *(optional)* | S3 bucket name. Omit to skip S3 upload |
-| `--local-only` | off | Explicitly keep outputs local; cannot be combined with `--s3-bucket` |
-| `--count-files-only` | off | Count files directly from the Drive API, write `workspace_file_count.json`, then exit |
-| `--size-only` | off | Fetch total Workspace storage size via Admin Reports API, write `workspace_storage_size.json`, then exit |
-| `--classify-only` | off | Skip file downloads and Gmail; classify metadata only |
-| `--export-only` | off | Download Drive + Gmail and upload to S3; skip LLM classification |
-| `--user EMAIL` | — | Process one user only (Drive + Gmail); skips org-wide listing |
-| `--gmail` | off | Fetch Gmail exports (auto-enabled with `--s3-bucket` or `--user`) |
-| `--no-gmail` | off | Skip Gmail even when S3/single-user mode would enable it |
+| `--admin EMAIL` | *(required)* | Workspace admin email for user listing / DWD |
+| `--user EMAIL` | — | Process one user only; auto-enables Gmail |
+| `--s3-bucket NAME` | — | S3 bucket name; auto-enables Gmail and triggers upload + local cleanup |
+| `--s3-prefix PREFIX` | auto | Override S3 key prefix (default: `<org>_<YYYY-MM-DD>`) |
+| `--export-only` | off | Download Drive + Gmail to S3; skip LLM classification |
+| `--classify-only` | off | Classify metadata only; skip downloads and Gmail |
+| `--local-only` | off | Keep outputs local; no S3 upload (cannot combine with `--s3-bucket`) |
+| `--gmail` | off | Fetch Gmail (auto-enabled with `--s3-bucket`, `--user`, or `--export-only`) |
+| `--no-gmail` | off | Skip Gmail even when it would otherwise be enabled |
+| `--since-days N` | 0 (all time) | Only process files/emails from the last N days |
+| `--modified-after YYYY-MM-DD` | — | Only process files/emails modified after this date |
 | `--skip EMAIL` | — | Skip a specific user (repeatable) |
-| `--since-days N` | 0 (all time) | Only process files modified in the last N days |
-| `--modified-after YYYY-MM-DD` | — | Only process files modified after this date |
-| `--extract-workers N` | 8 | Parallel threads for snippet extraction / LLM batching per user |
-| `--scan-workers N` | 4 | Parallel threads for Drive metadata scan phase |
+| `--only EMAIL` | — | Process only this user (repeatable; use `--user` for single-user lookup) |
 | `--max-files N` | 0 (unlimited) | Cap Drive file count per user |
-| `--snippet-bytes N` | 2048 | Bytes downloaded per file for LLM classification |
+| `--scan-workers N` | 4 | Parallel threads for Drive metadata scan |
+| `--extract-workers N` | 8 | Parallel threads for LLM snippet extraction (classify mode) |
+| `--snippet-bytes N` | 2048 | Bytes per file for LLM classification snippets |
+| `--pass1-model MODEL` | default | Fast model for classify pass 1 |
+| `--pass2-model MODEL` | default | Full model for classify pass 2 (low-confidence re-run) |
+| `--count-files-only` | off | Count Drive files, write `workspace_file_count.json`, exit |
+| `--size-only` | off | Fetch storage usage, write `workspace_storage_size.json`, exit |
 | `--out DIR` | `./out` | Output directory |
 | `--sa-file PATH` | `service_account.json` | Path to service account JSON |
 | `--dry-run` | off | List users only — do not process |
@@ -258,43 +295,30 @@ python3 run_org_classify.py \
 
 ## Project structure
 
-```
+```text
 workspace-classifier/
 ├── run_org_classify.py       ← main entry point
+├── s3_sync.py                ← S3 upload + local cleanup
 ├── requirements.txt
-├── .env.example              ← environment variable template
+├── .env.example
 │
 ├── gdrive/
-│   ├── credentials.py        ← DWD service account auth + user listing
+│   ├── credentials.py        ← DWD auth + org/single-user lookup
 │   ├── scan.py               ← Drive folder walker
-│   ├── fetch.py              ← file download helpers
+│   ├── fetch.py              ← snippet download helpers
 │   └── pipeline_1tb.py       ← parallel extract + two-pass LLM classify
 │
-├── extractors/
-│   ├── core.py               ← snippet extraction (PDF, DOCX, PPTX, images, …)
-│   ├── content_type.py
-│   ├── content_inventory.py
-│   ├── modality.py
-│   └── quality_tier.py
-│
 ├── dump/
-│   ├── full_download.py      ← full file download by bucket
+│   ├── full_download.py      ← Drive download (by bucket or by scan path)
 │   └── sample_selector.py    ← sample-based download
 │
 ├── gmail/
-│   └── fetch.py              ← Gmail export
+│   └── fetch.py              ← Gmail + attachment export
 │
-├── llm_provider.py           ← Anthropic / OpenAI abstraction
-├── segmenter.py              ← LLM prompt batching
-├── prompt.py                 ← classification prompts
-├── pii.py                    ← PII detection
-├── ingest.py                 ← file ingestion helpers
-├── checkpoint.py             ← incremental save helpers
-├── inventory_writer.py       ← XLSX / CSV writer
-├── excel_io.py               ← evidence DataFrame formatter
-├── artifact_summary.py
-├── subcategory_classifier.py
-├── subcategory_taxonomy.py
-├── s3_sync.py                ← S3 upload + local cleanup
-└── env_loader.py             ← loads .env from project root
+├── extractors/               ← file parsers (PDF, DOCX, PPTX, …)
+├── llm_provider.py             ← Anthropic / OpenAI abstraction
+├── segmenter.py                ← LLM prompt batching
+├── checkpoint.py               ← incremental save helpers
+├── inventory_writer.py         ← XLSX / CSV writer
+└── env_loader.py               ← loads .env from project root
 ```
