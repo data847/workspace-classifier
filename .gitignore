@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+operator.env
 service_account.json
 credentials.json
 token.json

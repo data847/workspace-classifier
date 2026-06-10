@@ -5,28 +5,30 @@
 Google Workspace data pipeline for org-wide or single-user runs. It can:
 
 - **Classify** every user's Drive files with an LLM and export inventory CSVs
-- **Export** raw Drive files and Gmail to S3 (no LLM)
-- **Upload** results to S3 with optional local cleanup
+- **Export** raw Drive files and Gmail (no LLM)
+- **Upload** results to **S3** or **Hetzner Storage Box** (SFTP, same as drivetocloud)
 
 ---
 
 ## Modes at a glance
 
-| Mode | Command | Classify? | Download Drive? | Gmail? | S3? | LLM key needed? |
-|------|---------|-----------|-----------------|--------|-----|-----------------|
-| **Full classify** | `--s3-bucket` | Yes | Yes (classified files) | Yes | Yes | Yes |
-| **Export only** | `--export-only --s3-bucket` | No | Yes (all scanned files) | Yes | Yes | No |
-| **Classify only** | `--classify-only --s3-bucket` | Yes | No | No | Yes (metadata only) | Yes |
-| **Local** | `--local-only` | Yes | Yes | With `--gmail` / `--user` | No | Yes |
+| Mode | Command | Classify? | Download Drive? | Gmail? | Remote upload? | LLM key? |
+|------|---------|-----------|-----------------|--------|----------------|----------|
+| **Export → Hetzner** | `--export-only --hetzner` | No | Yes | Yes | Hetzner SFTP | No |
+| **Export → S3** | `--export-only --s3-bucket` | No | Yes | Yes | S3 | No |
+| **Full classify** | `--s3-bucket` or `--hetzner` | Yes | Yes | Yes | Yes | Yes |
+| **Classify only** | `--classify-only --s3-bucket` | Yes | No | No | metadata only | Yes |
+| **Local** | `--local-only` | Yes | Yes | With `--user` | No | Yes |
 
-**Most common for data migration (Drive + email → S3, no classification):**
+**Most common for data migration (Drive + email → Hetzner, no classification):**
 
 ```bash
+# Place operator.env in the project folder (same file as drivetocloud)
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --user user@yourdomain.com \
   --export-only \
-  --s3-bucket your-s3-bucket
+  --hetzner
 ```
 
 ---
@@ -43,7 +45,7 @@ For every active user in the org:
 | **B — Classify** | Two-pass LLM classification. Pass 1 uses a fast model; Pass 2 re-runs a full model on low-confidence results. |
 | **C — Download** | Full Drive file download, organised by LLM bucket. |
 | **D — Gmail** | Fetch emails, attachments, and metadata. Auto-enabled when `--s3-bucket` or `--user` is set. |
-| **E — S3 sync** | Upload user output to S3, then delete local copies. |
+| **E — Remote sync** | Upload user output to S3 or Hetzner SFTP, then delete local copies. |
 
 ### Export-only mode (`--export-only`)
 
@@ -52,7 +54,7 @@ Skips LLM classification entirely. For each user:
 1. **Scan** Drive metadata
 2. **Download** all scanned Drive files → `dump/files/` (preserves folder paths)
 3. **Fetch** Gmail → `dump/emails/`
-4. **Upload** to S3 and delete local data
+4. **Upload** to S3 or Hetzner and delete local data
 
 No `inventory.csv`, no `org_inventory.csv`, no Anthropic/OpenAI API key required.
 
@@ -99,19 +101,25 @@ out/
   run_state.json
 ```
 
-### S3 layout
+### Remote layout (S3 or Hetzner)
 
-When `--s3-bucket` is set, the S3 prefix is auto-generated as `<org>_<YYYY-MM-DD>`:
+The remote prefix is auto-generated as `<org>_<YYYY-MM-DD>`:
+
+**S3** (`--s3-bucket`):
 
 ```text
-s3://<bucket>/<org>_<date>/org_inventory.csv          ← classify mode only
-s3://<bucket>/<org>_<date>/workspace_file_count.json
-s3://<bucket>/<org>_<date>/<user_slug>/inventory.csv  ← classify mode only
 s3://<bucket>/<org>_<date>/<user_slug>/dump/files/...
 s3://<bucket>/<org>_<date>/<user_slug>/dump/emails/...
 ```
 
-Local user directories are deleted after a successful S3 upload. Use `--local-only` to keep files on disk.
+**Hetzner Storage Box** (`--hetzner`, reads `operator.env`):
+
+```text
+sftp://<host>/<SFTP_BASE_PATH>/<org>_<date>/<user_slug>/dump/files/...
+sftp://<host>/<SFTP_BASE_PATH>/<org>_<date>/<user_slug>/dump/emails/...
+```
+
+Local user directories are deleted after a successful upload. Use `--local-only` to keep files on disk.
 
 ### CSV columns (classify mode)
 
@@ -130,7 +138,7 @@ Local user directories are deleted after a successful S3 upload. Use `--local-on
   - `https://www.googleapis.com/auth/admin.directory.user.readonly` *(org-wide runs; optional for `--user` without `--verify-user`)*
   - `https://www.googleapis.com/auth/admin.reports.usage.readonly` *(`--size-only` only)*
 - Anthropic or OpenAI API key *(classify mode only — not needed for `--export-only`)*
-- AWS credentials with `s3:PutObject` access *(needed for `--s3-bucket`)*
+- AWS credentials with `s3:PutObject` access *(for `--s3-bucket`)* **or** Hetzner Storage Box credentials in `operator.env` *(for `--hetzner`)*
 
 ### 2. Clone and install
 
@@ -166,6 +174,21 @@ AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
 ```
 
+### Hetzner Storage Box (`operator.env`)
+
+Same format as **drivetocloud / cloud_transfer**. Place `operator.env` in the project root (do not commit it):
+
+```env
+SFTP_HOST=u123456.your-storagebox.de
+SFTP_PORT=23
+SFTP_USERNAME=u123456
+SFTP_PASSWORD=your_password
+SFTP_BASE_PATH=workspace
+DESTINATION=sftp
+```
+
+You can copy the `operator.env` file from your drivetocloud setup directly.
+
 ### 4. Service account setup
 
 1. Enable **Google Drive API**, **Admin SDK API**, and **Gmail API** in Google Cloud Console.
@@ -193,9 +216,16 @@ tokens
 ```bash
 cd workspace-classifier/
 
+# ── Export only: Drive + Gmail → Hetzner (no LLM) ───────────────────────
+
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
+  --export-only \
+  --hetzner
+
 # ── Export only: Drive + Gmail → S3 (no LLM) ──────────────────────────────
 
-# Single user
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --user user@yourdomain.com \
@@ -275,8 +305,9 @@ python3 run_org_classify.py \
 | `--admin EMAIL` | *(required)* | Workspace admin email for user listing / DWD |
 | `--user EMAIL` | — | Process one user only; auto-enables Gmail (no Admin SDK lookup) |
 | `--verify-user` | off | With `--user`, validate account via Admin SDK |
-| `--s3-bucket NAME` | — | S3 bucket name; auto-enables Gmail and triggers upload + local cleanup |
-| `--s3-prefix PREFIX` | auto | Override S3 key prefix (default: `<org>_<YYYY-MM-DD>`) |
+| `--s3-bucket NAME` | — | S3 bucket; auto-enables Gmail and remote upload |
+| `--hetzner` | off | Upload to Hetzner Storage Box via SFTP (`operator.env`) |
+| `--s3-prefix PREFIX` | auto | Override remote key prefix (default: `<org>_<YYYY-MM-DD>`) |
 | `--export-only` | off | Download Drive + Gmail to S3; skip LLM classification |
 | `--classify-only` | off | Classify metadata only; skip downloads and Gmail |
 | `--local-only` | off | Keep outputs local; no S3 upload (cannot combine with `--s3-bucket`) |
@@ -306,6 +337,7 @@ python3 run_org_classify.py \
 workspace-classifier/
 ├── run_org_classify.py       ← main entry point
 ├── s3_sync.py                ← S3 upload + local cleanup
+├── sftp_sync.py              ← Hetzner Storage Box SFTP upload
 ├── requirements.txt
 ├── .env.example
 │

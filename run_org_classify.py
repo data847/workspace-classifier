@@ -53,6 +53,9 @@ Usage
   # Export only — download Drive + Gmail, push to S3 (no LLM classification)
   python run_org_classify.py --admin admin@company.com --user user@company.com --export-only --s3-bucket my-bucket
 
+  # Export only — download Drive + Gmail, push to Hetzner Storage Box (operator.env)
+  python run_org_classify.py --admin admin@company.com --user user@company.com --export-only --hetzner
+
   # Dry run: list users, don't process
   python run_org_classify.py --admin admin@company.com --dry-run
 
@@ -101,6 +104,7 @@ from gdrive.pipeline_1tb import build_inventory_from_drive_1tb
 from excel_io import evidence_display_dataframe
 from llm_provider import default_llm_model
 from s3_sync import S3Syncer
+from sftp_sync import SftpSyncer
 from checkpoint import (
     checkpoint_path_for_output,
     drive_artifact_checkpoint_path,
@@ -1074,29 +1078,30 @@ def _s3_upload_summary(user_dir: Path) -> tuple[int, int, int, float]:
     return len(all_files), len(drive_files), len(email_files), total_mb
 
 
-def _phase_s3_sync(
+def _phase_remote_sync(
     email: str,
     *,
     user_dir: Path,
-    syncer: S3Syncer | None,
+    syncer: S3Syncer | SftpSyncer | None,
     log_prefix: str,
+    dest_label: str,
 ) -> None:
     if syncer is None:
-        _phase_log(log_prefix, "s3", "SKIP — no bucket configured")
+        _phase_log(log_prefix, "sync", "SKIP — no remote destination configured")
         return
     t0 = time.time()
     n_files, drive_files, email_files, total_mb = _s3_upload_summary(user_dir)
     if n_files:
         _phase_log(
             log_prefix,
-            "s3",
+            "sync",
             f"START — uploading {n_files} files ({total_mb:.1f} MB) "
-            f"[drive={drive_files}, email={email_files}] → S3, then deleting local",
+            f"[drive={drive_files}, email={email_files}] → {dest_label}, then deleting local",
         )
     else:
-        _phase_log(log_prefix, "s3", "START — user_dir not found or empty, nothing to upload")
+        _phase_log(log_prefix, "sync", "START — user_dir not found or empty, nothing to upload")
     syncer.sync_user(user_dir, email=email, delete_after=True)
-    _phase_log(log_prefix, "s3", f"DONE in {_elapsed(t0)}")
+    _phase_log(log_prefix, "sync", f"DONE in {_elapsed(t0)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1272,7 +1277,10 @@ Examples:
     p.add_argument("--sa-file",           default="",                  help="Path to service_account.json (auto-detected if omitted)")
     p.add_argument("--s3-bucket",         default="",                  help="S3 bucket name (omit to keep files local)")
     p.add_argument("--s3-prefix",         default="",                  help="S3 key prefix (auto-generated if omitted)")
-    p.add_argument("--local-only",        action="store_true",         help="Keep outputs local; do not upload to S3 or delete user directories")
+    p.add_argument("--hetzner",           action="store_true",
+                   help="Upload to Hetzner Storage Box via SFTP (reads SFTP_* from operator.env)")
+    p.add_argument("--local-only",        action="store_true",
+                   help="Keep outputs local; do not upload remotely or delete user directories")
     p.add_argument("--pass1-model",       default="",                  help="Fast model for pass-1 (all files)")
     p.add_argument("--pass2-model",       default=default_llm_model(), help="Full model for pass-2 (low-confidence re-run)")
     p.add_argument("--max-files",         type=int, default=0,         help="Cap Drive file count per user (0=unlimited)")
@@ -1307,6 +1315,10 @@ Examples:
 
     if args.local_only and args.s3_bucket:
         p.error("--local-only cannot be used with --s3-bucket")
+    if args.local_only and args.hetzner:
+        p.error("--local-only cannot be used with --hetzner")
+    if args.s3_bucket and args.hetzner:
+        p.error("--s3-bucket and --hetzner cannot be used together")
     if args.size_only and args.count_files_only:
         p.error("--size-only cannot be combined with --count-files-only")
     if args.user and args.only:
@@ -1328,12 +1340,14 @@ Examples:
     modified_after = _parse_modified_after(args.since_days, args.modified_after)
     classify_only  = args.classify_only
     export_only    = args.export_only
+    use_remote     = bool(args.s3_bucket) or args.hetzner
     fetch_gmail    = (
         not classify_only
         and not args.no_gmail
-        and (export_only or args.gmail or bool(args.user) or bool(args.s3_bucket))
+        and (export_only or args.gmail or bool(args.user) or use_remote)
     )
-    local_only     = args.local_only or not bool(args.s3_bucket)
+    local_only     = args.local_only or not use_remote
+    dest_label     = "Hetzner SFTP" if args.hetzner else ("S3" if args.s3_bucket else "local")
 
     _log("=" * 60)
     _log(f"workspace-classifier  admin={args.admin}")
@@ -1348,11 +1362,15 @@ Examples:
     if fetch_gmail:
         mode_parts.append("gmail")
     if not args.count_files_only and not args.size_only:
-        mode_parts.append("local-only" if local_only else "s3")
+        mode_parts.append("local-only" if local_only else dest_label.lower())
     _log(f"mode={', '.join(mode_parts)}")
     _log(f"sa_file={sa_file}")
     _log(f"out_dir={out_dir}")
-    _log(f"s3_bucket={args.s3_bucket or '(none — local only)'}")
+    _log(f"destination={dest_label}")
+    if args.s3_bucket:
+        _log(f"s3_bucket={args.s3_bucket}")
+    if args.hetzner:
+        _log(f"hetzner_host={os.environ.get('SFTP_HOST', '(not set)')}")
     _log(f"modified_after={modified_after.date() if modified_after else 'all time'}")
     _log(f"scan_workers={args.scan_workers}")
     if args.user:
@@ -1361,8 +1379,8 @@ Examples:
         _log(f"only={', '.join(args.only)}")
     _log("=" * 60)
 
-    # ── S3 syncer ─────────────────────────────────────────────────────────────
-    syncer: S3Syncer | None = None
+    # ── Remote syncer (S3 or Hetzner SFTP) ────────────────────────────────────
+    syncer: S3Syncer | SftpSyncer | None = None
     if args.s3_bucket:
         syncer = S3Syncer(
             bucket=args.s3_bucket,
@@ -1371,6 +1389,17 @@ Examples:
             log=_log,
         )
         _log(f"S3 prefix: {syncer.prefix}/")
+    elif args.hetzner:
+        try:
+            syncer = SftpSyncer.from_env(
+                admin_email=args.admin,
+                prefix=args.s3_prefix,
+                log=_log,
+            )
+        except ValueError as e:
+            _log(f"ERROR: {e}")
+            return 1
+        _log(f"Hetzner remote path: {syncer.prefix}/")
 
     # ── Resolve target users ───────────────────────────────────────────────────
     if args.user:
@@ -1414,7 +1443,7 @@ Examples:
         )
         _log(f"file count JSON: {file_count_path}")
         if syncer and file_count_path.is_file():
-            _log("[s3] uploading workspace_file_count.json")
+            _log(f"[sync] uploading workspace_file_count.json → {dest_label}")
             syncer.upload_file(file_count_path, s3_sub_path="")
         return 0
 
@@ -1427,7 +1456,7 @@ Examples:
         )
         _log(f"storage size JSON: {size_path}")
         if syncer and size_path.is_file():
-            _log("[s3] uploading workspace_storage_size.json")
+            _log(f"[sync] uploading workspace_storage_size.json → {dest_label}")
             syncer.upload_file(size_path, s3_sub_path="")
         return 0
 
@@ -1484,7 +1513,7 @@ Examples:
                 _phase_log(pfx, "classify", "SKIP — previous run found no Drive files")
                 state.set(email, RunState.DONE)
                 if syncer:
-                    _phase_s3_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx)
+                    _phase_remote_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx, dest_label=dest_label)
                     state.set(email, RunState.S3_SYNCED)
                 else:
                     state.set(email, RunState.LOCAL_DONE)
@@ -1492,10 +1521,10 @@ Examples:
             _log(f"{pfx} scan failed — skipping classify")
             continue
 
-        # Already classified locally but not yet S3-synced (e.g. previous run was local-only)
+        # Already classified locally but not yet remote-synced (e.g. previous run was local-only)
         if state.needs_s3_sync(email) and syncer:
-            _log(f"{pfx} already classified — uploading to S3")
-            _phase_s3_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx)
+            _log(f"{pfx} already classified — uploading to {dest_label}")
+            _phase_remote_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx, dest_label=dest_label)
             state.set(email, RunState.S3_SYNCED)
             continue
 
@@ -1598,7 +1627,7 @@ Examples:
 
             # Phase E — finalize output
             if syncer:
-                _phase_s3_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx)
+                _phase_remote_sync(email, user_dir=user_dir, syncer=syncer, log_prefix=pfx, dest_label=dest_label)
                 state.set(email, RunState.S3_SYNCED)
             else:
                 _phase_log(pfx, "local", f"DONE — output kept at {user_dir}")
@@ -1624,15 +1653,18 @@ Examples:
     _log(f"combined CSV: {combined_csv}")
     _log(f"file count JSON: {file_count_path}")
     if syncer:
-        _log(f"S3 output:   s3://{args.s3_bucket}/{syncer.prefix}/")
+        if args.hetzner:
+            _log(f"remote output: sftp://{os.environ.get('SFTP_HOST', '')}/{syncer.prefix}/")
+        else:
+            _log(f"remote output: s3://{args.s3_bucket}/{syncer.prefix}/")
     _log("=" * 60)
 
-    # Upload combined CSV to S3 root (classification runs only)
+    # Upload combined CSV to remote root (classification runs only)
     if syncer and not export_only and combined_csv.is_file():
-        _log("[s3] uploading org_inventory.csv")
+        _log(f"[sync] uploading org_inventory.csv → {dest_label}")
         syncer.upload_file(combined_csv, s3_sub_path="")
     if syncer and file_count_path.is_file():
-        _log("[s3] uploading workspace_file_count.json")
+        _log(f"[sync] uploading workspace_file_count.json → {dest_label}")
         syncer.upload_file(file_count_path, s3_sub_path="")
 
     # Zip everything remaining in out_dir (combined CSV + run_state + any kept user dirs)

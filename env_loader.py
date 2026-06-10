@@ -9,8 +9,11 @@ from dotenv import dotenv_values, load_dotenv
 
 _ROOT = Path(__file__).resolve().parent
 _ENV_PATH = _ROOT / ".env"
+_OPERATOR_ENV_PATH = _ROOT / "operator.env"
 
 load_dotenv(_ENV_PATH)
+# Shared infrastructure creds (Hetzner SFTP, etc.) — same as drivetocloud / cloud_transfer.
+load_dotenv(_OPERATOR_ENV_PATH, override=True)
 
 
 def _fill_key(env_var: str) -> None:
