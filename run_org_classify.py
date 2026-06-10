@@ -94,6 +94,7 @@ from gdrive.credentials import (
     default_sa_path,
     get_org_user,
     list_org_users,
+    user_from_email,
 )
 from gdrive.scan import walk_drive_folder
 from gdrive.pipeline_1tb import build_inventory_from_drive_1tb
@@ -1265,6 +1266,8 @@ Examples:
     p.add_argument("--admin",             required=True,               help="Admin email for org user listing")
     p.add_argument("--user",              default="",                  metavar="EMAIL",
                    help="Process a single user only (Drive + Gmail); skips org-wide user listing")
+    p.add_argument("--verify-user",       action="store_true",
+                   help="With --user, validate the account via Admin SDK (needs admin.directory.user.readonly)")
     p.add_argument("--out",               default="out",               help="Output root directory (default: out)")
     p.add_argument("--sa-file",           default="",                  help="Path to service_account.json (auto-detected if omitted)")
     p.add_argument("--s3-bucket",         default="",                  help="S3 bucket name (omit to keep files local)")
@@ -1371,13 +1374,17 @@ Examples:
 
     # ── Resolve target users ───────────────────────────────────────────────────
     if args.user:
-        _log(f"looking up single user via Admin SDK: {args.user}")
-        try:
-            users = [get_org_user(args.user, args.admin, sa_file=sa_file)]
-        except ValueError as e:
-            _log(f"ERROR: {e}")
-            return 1
-        _log(f"found user: {users[0]['email']} ({users[0]['name']})")
+        if args.verify_user:
+            _log(f"looking up single user via Admin SDK: {args.user}")
+            try:
+                users = [get_org_user(args.user, args.admin, sa_file=sa_file)]
+            except ValueError as e:
+                _log(f"ERROR: {e}")
+                return 1
+            _log(f"found user: {users[0]['email']} ({users[0]['name']})")
+        else:
+            users = [user_from_email(args.user)]
+            _log(f"single user: {users[0]['email']} (Admin SDK lookup skipped — use --verify-user to validate)")
     else:
         _log("listing org users via Admin SDK...")
         users = list_org_users(args.admin, sa_file=sa_file)

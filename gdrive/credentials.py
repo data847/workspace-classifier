@@ -135,6 +135,12 @@ def list_org_users(admin_email: str, *, sa_file: Path | str | None = None) -> li
     return users
 
 
+def user_from_email(user_email: str) -> dict:
+    """Minimal user record without Admin SDK (Drive/Gmail DWD only)."""
+    email = user_email.strip()
+    return {"email": email, "name": "", "org_unit": "/"}
+
+
 def get_org_user(
     user_email: str,
     admin_email: str,

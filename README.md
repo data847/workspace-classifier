@@ -125,10 +125,10 @@ Local user directories are deleted after a successful S3 upload. Use `--local-on
 
 - Python 3.10+
 - Google Cloud **service account** with **Domain-Wide Delegation** and these Admin-authorized scopes:
-  - `https://www.googleapis.com/auth/drive.readonly`
-  - `https://www.googleapis.com/auth/admin.directory.user.readonly`
-  - `https://www.googleapis.com/auth/admin.reports.usage.readonly`
-  - `https://www.googleapis.com/auth/gmail.readonly` *(needed for Gmail export)*
+  - `https://www.googleapis.com/auth/drive.readonly` *(required)*
+  - `https://www.googleapis.com/auth/gmail.readonly` *(Gmail export)*
+  - `https://www.googleapis.com/auth/admin.directory.user.readonly` *(org-wide runs; optional for `--user` without `--verify-user`)*
+  - `https://www.googleapis.com/auth/admin.reports.usage.readonly` *(`--size-only` only)*
 - Anthropic or OpenAI API key *(classify mode only — not needed for `--export-only`)*
 - AWS credentials with `s3:PutObject` access *(needed for `--s3-bucket`)*
 
@@ -273,7 +273,8 @@ python3 run_org_classify.py \
 | Flag | Default | Description |
 |---|---|---|
 | `--admin EMAIL` | *(required)* | Workspace admin email for user listing / DWD |
-| `--user EMAIL` | — | Process one user only; auto-enables Gmail |
+| `--user EMAIL` | — | Process one user only; auto-enables Gmail (no Admin SDK lookup) |
+| `--verify-user` | off | With `--user`, validate account via Admin SDK |
 | `--s3-bucket NAME` | — | S3 bucket name; auto-enables Gmail and triggers upload + local cleanup |
 | `--s3-prefix PREFIX` | auto | Override S3 key prefix (default: `<org>_<YYYY-MM-DD>`) |
 | `--export-only` | off | Download Drive + Gmail to S3; skip LLM classification |
