@@ -1,5 +1,7 @@
 # workspace-classifier
 
+**Repository:** https://github.com/data847/workspace-classifier
+
 Google Workspace data pipeline for org-wide or single-user runs. It can:
 
 - **Classify** every user's Drive files with an LLM and export inventory CSVs
@@ -130,11 +132,15 @@ Local user directories are deleted after a successful S3 upload. Use `--local-on
 - Anthropic or OpenAI API key *(classify mode only — not needed for `--export-only`)*
 - AWS credentials with `s3:PutObject` access *(needed for `--s3-bucket`)*
 
-### 2. Install dependencies
+### 2. Clone and install
 
 ```bash
+git clone https://github.com/data847/workspace-classifier.git
+cd workspace-classifier
 pip install -r requirements.txt
 ```
+
+For **export-only** runs (`--export-only`), you only need the Google + AWS + core packages. LLM and file-extractor packages are required for classify mode.
 
 ### 3. Configure environment
 
