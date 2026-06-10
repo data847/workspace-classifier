@@ -23,7 +23,7 @@ Google Workspace data pipeline for org-wide or single-user runs. It can:
 **Most common for data migration (Drive + email → Hetzner, no classification):**
 
 ```bash
-# Place operator.env in the project folder (same file as drivetocloud)
+# Prompts for Hetzner credentials in the terminal when you run it
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --user user@yourdomain.com \
@@ -174,9 +174,22 @@ AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
 ```
 
-### Hetzner Storage Box (`operator.env`)
+### Hetzner Storage Box
 
-Same format as **drivetocloud / cloud_transfer**. Place `operator.env` in the project root (do not commit it):
+When you pass `--hetzner`, the tool **prompts for credentials in the terminal**:
+
+```text
+── Hetzner Storage Box credentials ──
+  Hostname (e.g. u123456.your-storagebox.de): u123456.your-storagebox.de
+  Port [23]: 
+  Username (e.g. u123456): u123456
+  Password: 
+  Remote base folder [workspace]: 
+```
+
+Find these in **Hetzner Robot → Storage Boxes → your box**.
+
+Optionally, set env vars (or `operator.env`) to skip the prompt:
 
 ```env
 SFTP_HOST=u123456.your-storagebox.de
@@ -184,10 +197,7 @@ SFTP_PORT=23
 SFTP_USERNAME=u123456
 SFTP_PASSWORD=your_password
 SFTP_BASE_PATH=workspace
-DESTINATION=sftp
 ```
-
-You can copy the `operator.env` file from your drivetocloud setup directly.
 
 ### 4. Service account setup
 
@@ -306,7 +316,7 @@ python3 run_org_classify.py \
 | `--user EMAIL` | — | Process one user only; auto-enables Gmail (no Admin SDK lookup) |
 | `--verify-user` | off | With `--user`, validate account via Admin SDK |
 | `--s3-bucket NAME` | — | S3 bucket; auto-enables Gmail and remote upload |
-| `--hetzner` | off | Upload to Hetzner Storage Box via SFTP (`operator.env`) |
+| `--hetzner` | off | Upload to Hetzner Storage Box via SFTP (terminal prompt for creds) |
 | `--s3-prefix PREFIX` | auto | Override remote key prefix (default: `<org>_<YYYY-MM-DD>`) |
 | `--export-only` | off | Download Drive + Gmail to S3; skip LLM classification |
 | `--classify-only` | off | Classify metadata only; skip downloads and Gmail |

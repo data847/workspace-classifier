@@ -1278,7 +1278,7 @@ Examples:
     p.add_argument("--s3-bucket",         default="",                  help="S3 bucket name (omit to keep files local)")
     p.add_argument("--s3-prefix",         default="",                  help="S3 key prefix (auto-generated if omitted)")
     p.add_argument("--hetzner",           action="store_true",
-                   help="Upload to Hetzner Storage Box via SFTP (reads SFTP_* from operator.env)")
+                   help="Upload to Hetzner Storage Box via SFTP (prompts for creds in terminal)")
     p.add_argument("--local-only",        action="store_true",
                    help="Keep outputs local; do not upload remotely or delete user directories")
     p.add_argument("--pass1-model",       default="",                  help="Fast model for pass-1 (all files)")

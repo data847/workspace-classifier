@@ -17,17 +17,61 @@ Usage::
 
 from __future__ import annotations
 
+import getpass
 import os
 import shutil
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from s3_sync import _auto_prefix
+
+
+def _prompt(label: str, *, default: str = "", secret: bool = False) -> str:
+    hint = f" [{default}]" if default else ""
+    try:
+        if secret:
+            val = getpass.getpass(f"  {label}{hint}: ")
+        else:
+            val = input(f"  {label}{hint}: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.", file=sys.stderr)
+        raise SystemExit(130) from None
+    return val if val else default
+
+
+def prompt_hetzner_credentials() -> dict[str, str]:
+    """Ask for Hetzner Storage Box credentials interactively in the terminal."""
+    print()
+    print("── Hetzner Storage Box credentials ──")
+    print("  (from Hetzner Robot → Storage Boxes → your box)")
+    print()
+    host = _prompt("Hostname (e.g. u123456.your-storagebox.de)")
+    while not host:
+        print("  Hostname is required.")
+        host = _prompt("Hostname (e.g. u123456.your-storagebox.de)")
+    port = _prompt("Port", default="23")
+    username = _prompt("Username (e.g. u123456)")
+    while not username:
+        print("  Username is required.")
+        username = _prompt("Username (e.g. u123456)")
+    password = _prompt("Password", secret=True)
+    while not password:
+        print("  Password is required.")
+        password = _prompt("Password", secret=True)
+    base_path = _prompt("Remote base folder", default="workspace")
+    print()
+    return {
+        "SFTP_HOST": host,
+        "SFTP_PORT": port,
+        "SFTP_USERNAME": username,
+        "SFTP_PASSWORD": password,
+        "SFTP_BASE_PATH": base_path,
+    }
 
 
 class SftpSyncer:
@@ -78,15 +122,30 @@ class SftpSyncer:
         prefix: str = "",
         max_workers: int | None = None,
         log: Any = None,
+        prompt: bool = True,
     ) -> "SftpSyncer":
+        """Load SFTP creds from env; prompt in the terminal if missing."""
         host = (os.environ.get("SFTP_HOST") or "").strip()
         username = (os.environ.get("SFTP_USERNAME") or "").strip()
         password = (os.environ.get("SFTP_PASSWORD") or "").strip()
+
+        if (not host or not username or not password) and prompt:
+            creds = prompt_hetzner_credentials()
+            host = creds["SFTP_HOST"]
+            username = creds["SFTP_USERNAME"]
+            password = creds["SFTP_PASSWORD"]
+            os.environ.setdefault("SFTP_HOST", host)
+            os.environ.setdefault("SFTP_PORT", creds["SFTP_PORT"])
+            os.environ.setdefault("SFTP_USERNAME", username)
+            os.environ.setdefault("SFTP_PASSWORD", password)
+            os.environ.setdefault("SFTP_BASE_PATH", creds["SFTP_BASE_PATH"])
+
         if not host or not username or not password:
             raise ValueError(
-                "Hetzner SFTP credentials missing. Set SFTP_HOST, SFTP_USERNAME, and "
-                "SFTP_PASSWORD in operator.env (same format as drivetocloud)."
+                "Hetzner SFTP credentials missing. Run with --hetzner to enter them "
+                "in the terminal, or set SFTP_HOST, SFTP_USERNAME, and SFTP_PASSWORD."
             )
+
         port = int((os.environ.get("SFTP_PORT") or "23").strip() or "23")
         base_path = (os.environ.get("SFTP_BASE_PATH") or "workspace").strip() or "workspace"
         workers = max_workers
