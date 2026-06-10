@@ -31,8 +31,20 @@ out/
   workspace_storage_size.json    ← total Workspace storage size (MB/GB/TB) plus per-user usage
   <user_slug>/inventory.csv      ← per-user CSV
   <user_slug>/inventory.xlsx     ← per-user XLSX (uploaded to S3, then deleted locally unless local-only)
+  <user_slug>/dump/files/        ← full Drive downloads (uploaded to S3, then deleted locally)
+  <user_slug>/dump/emails/       ← Gmail export JSON/CSV/attachments (uploaded to S3, then deleted locally)
   run_state.json                 ← resume state
 ```
+
+When `--s3-bucket` is set, each user's output is uploaded to:
+
+```text
+s3://<bucket>/<org>_<date>/<user_slug>/inventory.csv
+s3://<bucket>/<org>_<date>/<user_slug>/dump/files/...
+s3://<bucket>/<org>_<date>/<user_slug>/dump/emails/...
+```
+
+Org-level files (`org_inventory.csv`, `workspace_file_count.json`) are uploaded to the prefix root.
 
 ### CSV columns
 
@@ -187,9 +199,15 @@ python3 run_org_classify.py \
   --admin admin@yourdomain.com \
   --size-only
 
-# Full mode (classify + download files + fetch Gmail)
+# Full mode — classify, download Drive files, fetch Gmail, upload all to S3
 python3 run_org_classify.py \
   --admin admin@yourdomain.com \
+  --s3-bucket your-s3-bucket
+
+# Single user — Drive + Gmail → S3
+python3 run_org_classify.py \
+  --admin admin@yourdomain.com \
+  --user user@yourdomain.com \
   --s3-bucket your-s3-bucket
 
 # Dry run — list users only, no processing
@@ -214,6 +232,9 @@ python3 run_org_classify.py \
 | `--count-files-only` | off | Count files directly from the Drive API, write `workspace_file_count.json`, then exit |
 | `--size-only` | off | Fetch total Workspace storage size via Admin Reports API, write `workspace_storage_size.json`, then exit |
 | `--classify-only` | off | Skip file downloads and Gmail; classify metadata only |
+| `--user EMAIL` | — | Process one user only (Drive + Gmail); skips org-wide listing |
+| `--gmail` | off | Fetch Gmail exports (auto-enabled with `--s3-bucket` or `--user`) |
+| `--no-gmail` | off | Skip Gmail even when S3/single-user mode would enable it |
 | `--skip EMAIL` | — | Skip a specific user (repeatable) |
 | `--since-days N` | 0 (all time) | Only process files modified in the last N days |
 | `--modified-after YYYY-MM-DD` | — | Only process files modified after this date |

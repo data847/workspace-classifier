@@ -47,6 +47,9 @@ Usage
   # Last 30 days
   python run_org_classify.py --admin admin@company.com --s3-bucket my-bucket --since-days 30
 
+  # Single user — Drive classify + download + Gmail (no org-wide user listing)
+  python run_org_classify.py --admin admin@company.com --user user@company.com --local-only
+
   # Dry run: list users, don't process
   python run_org_classify.py --admin admin@company.com --dry-run
 
@@ -86,6 +89,7 @@ from gdrive.credentials import (
     build_drive_service_dwd,
     get_dwd_credentials,
     default_sa_path,
+    get_org_user,
     list_org_users,
 )
 from gdrive.scan import walk_drive_folder
@@ -977,6 +981,20 @@ def _phase_gmail(
 # Phase E: S3 upload + local delete
 # ---------------------------------------------------------------------------
 
+def _s3_upload_summary(user_dir: Path) -> tuple[int, int, int, float]:
+    """Return (total_files, drive_files, email_files, total_mb) under user_dir."""
+    if not user_dir.is_dir():
+        return 0, 0, 0, 0.0
+
+    drive_root = user_dir / "dump" / "files"
+    email_root = user_dir / "dump" / "emails"
+    all_files = [f for f in user_dir.rglob("*") if f.is_file()]
+    drive_files = [f for f in all_files if drive_root in f.parents or f == drive_root]
+    email_files = [f for f in all_files if email_root in f.parents or f == email_root]
+    total_mb = sum(f.stat().st_size for f in all_files) / 1_048_576
+    return len(all_files), len(drive_files), len(email_files), total_mb
+
+
 def _phase_s3_sync(
     email: str,
     *,
@@ -988,12 +1006,16 @@ def _phase_s3_sync(
         _phase_log(log_prefix, "s3", "SKIP — no bucket configured")
         return
     t0 = time.time()
-    if user_dir.exists():
-        n_files = sum(1 for f in user_dir.rglob("*") if f.is_file())
-        total_mb = sum(f.stat().st_size for f in user_dir.rglob("*") if f.is_file()) / 1_048_576
-        _phase_log(log_prefix, "s3", f"START — uploading {n_files} files ({total_mb:.1f} MB) → S3, then deleting local")
+    n_files, drive_files, email_files, total_mb = _s3_upload_summary(user_dir)
+    if n_files:
+        _phase_log(
+            log_prefix,
+            "s3",
+            f"START — uploading {n_files} files ({total_mb:.1f} MB) "
+            f"[drive={drive_files}, email={email_files}] → S3, then deleting local",
+        )
     else:
-        _phase_log(log_prefix, "s3", "START — user_dir not found, nothing to upload")
+        _phase_log(log_prefix, "s3", "START — user_dir not found or empty, nothing to upload")
     syncer.sync_user(user_dir, email=email, delete_after=True)
     _phase_log(log_prefix, "s3", f"DONE in {_elapsed(t0)}")
 
@@ -1155,11 +1177,16 @@ Examples:
   # Dry run — list users only
   python run_org_classify.py --admin admin@co.com --dry-run
 
+  # Single user — Drive + Gmail extraction
+  python run_org_classify.py --admin admin@co.com --user user@co.com --local-only
+
   # Resume a stopped run — re-run the exact same command
   python run_org_classify.py --admin admin@co.com --s3-bucket my-bucket
         """,
     )
     p.add_argument("--admin",             required=True,               help="Admin email for org user listing")
+    p.add_argument("--user",              default="",                  metavar="EMAIL",
+                   help="Process a single user only (Drive + Gmail); skips org-wide user listing")
     p.add_argument("--out",               default="out",               help="Output root directory (default: out)")
     p.add_argument("--sa-file",           default="",                  help="Path to service_account.json (auto-detected if omitted)")
     p.add_argument("--s3-bucket",         default="",                  help="S3 bucket name (omit to keep files local)")
@@ -1185,7 +1212,9 @@ Examples:
     p.add_argument("--classify-only",     action="store_true",
                    help="Skip file downloads and Gmail; classify metadata only")
     p.add_argument("--gmail",             action="store_true",
-                   help="Fetch Gmail and store raw exports with the run output (off by default; no LLM classification of emails)")
+                   help="Fetch Gmail and store raw exports (auto-enabled with --s3-bucket or --user)")
+    p.add_argument("--no-gmail",          action="store_true",
+                   help="Skip Gmail export even when --s3-bucket or --user would enable it")
     p.add_argument("--scan-workers",      type=int, default=4,         metavar="N",
                    help="Parallel threads for Drive metadata scan phase (default: 4)")
     p.add_argument("--extract-workers",  type=int, default=8,         metavar="N",
@@ -1197,6 +1226,10 @@ Examples:
         p.error("--local-only cannot be used with --s3-bucket")
     if args.size_only and args.count_files_only:
         p.error("--size-only cannot be combined with --count-files-only")
+    if args.user and args.only:
+        p.error("--user and --only cannot be used together")
+    if args.gmail and args.no_gmail:
+        p.error("--gmail and --no-gmail cannot be used together")
 
     sa_file        = Path(args.sa_file).expanduser().resolve() if args.sa_file else default_sa_path()
     out_dir        = (_ROOT / args.out).resolve()
@@ -1205,9 +1238,15 @@ Examples:
     max_files      = None if args.max_files == 0 else args.max_files
     skip_set       = set(args.skip)
     only_set       = set(args.only)
+    if args.user:
+        only_set = {args.user.strip()}
     modified_after = _parse_modified_after(args.since_days, args.modified_after)
     classify_only  = args.classify_only
-    fetch_gmail    = args.gmail and not classify_only
+    fetch_gmail    = (
+        not classify_only
+        and not args.no_gmail
+        and (args.gmail or bool(args.user) or bool(args.s3_bucket))
+    )
     local_only     = args.local_only or not bool(args.s3_bucket)
 
     _log("=" * 60)
@@ -1228,7 +1267,9 @@ Examples:
     _log(f"s3_bucket={args.s3_bucket or '(none — local only)'}")
     _log(f"modified_after={modified_after.date() if modified_after else 'all time'}")
     _log(f"scan_workers={args.scan_workers}")
-    if args.only:
+    if args.user:
+        _log(f"user={args.user} (single-user mode — Drive + Gmail)")
+    elif args.only:
         _log(f"only={', '.join(args.only)}")
     _log("=" * 60)
 
@@ -1243,13 +1284,22 @@ Examples:
         )
         _log(f"S3 prefix: {syncer.prefix}/")
 
-    # ── List org users ─────────────────────────────────────────────────────────
-    _log("listing org users via Admin SDK...")
-    users = list_org_users(args.admin, sa_file=sa_file)
-    users = [u for u in users if u["email"] not in skip_set]
-    if only_set:
-        users = [u for u in users if u["email"] in only_set]
-    _log(f"found {len(users)} active users (after skips/only filter)")
+    # ── Resolve target users ───────────────────────────────────────────────────
+    if args.user:
+        _log(f"looking up single user via Admin SDK: {args.user}")
+        try:
+            users = [get_org_user(args.user, args.admin, sa_file=sa_file)]
+        except ValueError as e:
+            _log(f"ERROR: {e}")
+            return 1
+        _log(f"found user: {users[0]['email']} ({users[0]['name']})")
+    else:
+        _log("listing org users via Admin SDK...")
+        users = list_org_users(args.admin, sa_file=sa_file)
+        users = [u for u in users if u["email"] not in skip_set]
+        if only_set:
+            users = [u for u in users if u["email"] in only_set]
+        _log(f"found {len(users)} active users (after skips/only filter)")
 
     if args.dry_run:
         for u in users:
@@ -1409,16 +1459,19 @@ Examples:
             _phase_log(pfx, "csv", f"writing per-user CSV + appending to combined CSV")
             _write_user_csv(email, evidence_df, user_dir, combined_csv)
 
-            if not evidence_df.empty and not classify_only:
-                # Phase C — full file download
-                _phase_download(
-                    email, evidence_df,
-                    user_dir=user_dir,
-                    sa_file=sa_file,
-                    log_prefix=pfx,
-                )
+            if not classify_only:
+                # Phase C — full file download (requires classified evidence)
+                if not evidence_df.empty:
+                    _phase_download(
+                        email, evidence_df,
+                        user_dir=user_dir,
+                        sa_file=sa_file,
+                        log_prefix=pfx,
+                    )
+                elif file_count > 0:
+                    _phase_log(pfx, "download", "SKIP — no classified evidence rows")
 
-                # Phase D — Gmail (only when --gmail flag is passed)
+                # Phase D — Gmail (auto-enabled with --s3-bucket or --user)
                 if fetch_gmail:
                     _phase_gmail(
                         email,

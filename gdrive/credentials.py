@@ -135,6 +135,29 @@ def list_org_users(admin_email: str, *, sa_file: Path | str | None = None) -> li
     return users
 
 
+def get_org_user(
+    user_email: str,
+    admin_email: str,
+    *,
+    sa_file: Path | str | None = None,
+) -> dict:
+    """Return metadata for a single active Workspace user via Admin SDK."""
+    from googleapiclient.errors import HttpError
+
+    svc = build_admin_service(admin_email, sa_file=sa_file)
+    try:
+        u = svc.users().get(userKey=user_email).execute()
+    except HttpError as e:
+        raise ValueError(f"User not found or not accessible: {user_email}") from e
+    if u.get("suspended"):
+        raise ValueError(f"User is suspended: {user_email}")
+    return {
+        "email":    u.get("primaryEmail", user_email),
+        "name":     u.get("name", {}).get("fullName", ""),
+        "org_unit": u.get("orgUnitPath", "/"),
+    }
+
+
 def default_client_secrets_path() -> Path:
     """Prefer ``GOOGLE_OAUTH_CLIENT_SECRETS``; otherwise ``.secrets/google_oauth_client.json``.
 

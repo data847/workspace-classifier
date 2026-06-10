@@ -141,6 +141,8 @@ class S3Syncer:
             return 0, 0
 
         files = [f for f in local_dir.rglob("*") if f.is_file()]
+        uploaded_before = self._uploaded
+        failed_before = self._failed
         self._log(f"[s3] uploading {len(files)} files from {local_dir} → "
                   f"s3://{self._bucket}/{self._prefix}/{s3_sub_path}")
 
@@ -159,8 +161,10 @@ class S3Syncer:
                 if done % 100 == 0:
                     self._log(f"[s3] {done}/{len(files)} uploaded...")
 
-        self._log(f"[s3] upload complete: {self._uploaded} ok, {self._failed} failed")
-        return self._uploaded, self._failed
+        batch_uploaded = self._uploaded - uploaded_before
+        batch_failed = self._failed - failed_before
+        self._log(f"[s3] upload complete: {batch_uploaded} ok, {batch_failed} failed")
+        return batch_uploaded, batch_failed
 
     def upload_file(self, local_file: Path, *, s3_sub_path: str = "") -> bool:
         """Upload a single file to S3."""
@@ -191,9 +195,11 @@ class S3Syncer:
         """
         s3_sub = email.replace("@", "_at_").replace(".", "_")
         uploaded, failed = self.upload_dir(user_dir, s3_sub_path=s3_sub)
-        success = failed == 0 and uploaded > 0
-        if success and delete_after:
+        success = failed == 0
+        if success and uploaded == 0:
+            self._log(f"[s3] warn: {email} — nothing to upload from {user_dir}")
+        if success and delete_after and uploaded > 0:
             self.delete_local(user_dir, log=self._log_fn)
-        elif not success:
+        elif failed > 0:
             self._log(f"[s3] warn: {email} had {failed} failed uploads — local files kept")
-        return success
+        return success and uploaded > 0
